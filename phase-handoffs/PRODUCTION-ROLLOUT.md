@@ -52,3 +52,28 @@ The systemd user service is designed for a lingering botadmin user and a writabl
 - CI on PR and main.
 
 No additional real-money order is required for this rollout because Phase 8 already completed the accepted round-trip canary.
+
+
+## Deployment result
+
+Production operator rollout completed on the botadmin VPS after PRs #10-#12 were green and merged.
+
+- release: 0.9.0
+- service: user unit `trading-platform-live.service`
+- service state: enabled + active
+- user lingering: enabled, so the service can return after reboot
+- bind: `127.0.0.1:48070` only
+- startup private Binance preflight: PASS
+- restart fail-closed drill: PASS
+- health mode: `live_operator`
+- live capability: enabled
+- armed: false
+- kill switch: true
+- BTCUSDT position after rollout: 0.000
+- BTCUSDT open orders after rollout: 0
+- direct CCXT production position/open-order read smoke: PASS
+- main CI after the final broker fix: PASS
+
+The accepted Phase 8 canary ledger was preserved as the initial production live-state history. Its round trip consumed 168.4571 USDT of the configured 200 USDT UTC-day notional budget; this is intentionally not reset or bypassed during rollout.
+
+No additional real-money order was placed during production rollout.
