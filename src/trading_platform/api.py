@@ -14,16 +14,19 @@ from .datasets import (
     HistoricalDataService,
     HistoricalDatasetStore,
 )
+from .dashboard import dashboard_response
 from .domain import OrderIntent, Side
 from .execution import PaperBroker
 from .market import CCXTMarketData
+from .metrics import collect_metrics
 from .paper import PaperTradingService
 from .registry import default_strategy_registry
 from .research import VectorBTResearch, VectorBTUnavailable
 from .risk import RiskRejected
+from .simulation import SimulationPlanStore, SimulationSpec, default_simulation_registry
 from .sweep import run_sma_parameter_sweep
 
-app = FastAPI(title="Trading Platform", version="0.3.0")
+app = FastAPI(title="Trading Platform", version="0.4.0")
 
 data_root = Path(os.getenv("TRADING_DATA_DIR", "data"))
 paper = PaperBroker()
@@ -32,6 +35,8 @@ strategies = default_strategy_registry()
 paper_service = PaperTradingService(paper, audit, strategies)
 dataset_store = HistoricalDatasetStore(data_root / "historical")
 historical_data = HistoricalDataService(dataset_store)
+simulations = default_simulation_registry()
+simulation_plans = SimulationPlanStore(data_root / "simulations")
 
 
 class PaperOrder(BaseModel):
@@ -95,6 +100,14 @@ class SMASweepRequest(BaseModel):
     slow_values: list[int] = Field(default_factory=lambda: [20, 50], min_length=1)
 
 
+class SimulationPlanRequest(BaseModel):
+    dataset_id: str
+    strategy: str = "sma_trend"
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"fast": 5, "slow": 20})
+    initial_cash: float = Field(default=100_000.0, gt=0)
+    base_currency: str = Field(default="USD", min_length=3, max_length=12)
+
+
 def _market(exchange: str) -> CCXTMarketData:
     try:
         return CCXTMarketData(exchange)
@@ -124,13 +137,67 @@ def health():
         "status": "ok",
         "mode": "paper",
         "live_trading": False,
-        "version": "0.3.0",
+        "version": "0.4.0",
     }
 
 
 @app.get("/strategies")
 def strategy_catalog():
     return strategies.catalog()
+
+
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return dashboard_response()
+
+
+@app.get("/metrics")
+def platform_metrics():
+    return asdict(collect_metrics(dataset_store, paper.portfolio, audit))
+
+
+@app.get("/simulations/engines")
+def simulation_engines():
+    return simulations.catalog()
+
+
+@app.get("/simulations/plans")
+def list_simulation_plans():
+    return simulation_plans.list()
+
+
+@app.get("/simulations/plans/{plan_id}")
+def get_simulation_plan(plan_id: str):
+    try:
+        return asdict(simulation_plans.load(plan_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="simulation plan not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/simulations/{engine}/plans")
+def create_simulation_plan(engine: str, req: SimulationPlanRequest):
+    dataset = _load_dataset(req.dataset_id)
+    try:
+        adapter = simulations.get(engine)
+        plan = adapter.plan(
+            dataset,
+            SimulationSpec(
+                engine=engine,
+                dataset_id=dataset.dataset_id,
+                symbol=dataset.symbol,
+                strategy=req.strategy,
+                parameters=req.parameters,
+                initial_cash=req.initial_cash,
+                base_currency=req.base_currency.upper(),
+            ),
+        )
+        simulation_plans.save(plan)
+        return asdict(plan)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 
 
 @app.get("/market/{exchange}/ticker")
