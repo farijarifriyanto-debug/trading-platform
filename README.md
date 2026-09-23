@@ -374,6 +374,10 @@ Phase 8 validation includes:
 
 Backtest and simulation results are research outputs, not profit guarantees.
 
-## Next phase
+## Production operator mode
 
-Phase 8 real-money acceptance is complete: an explicitly approved Binance USD-M Futures canary entered 0.001 BTC at 1x isolated through the one-shot live boundary, then closed the same quantity with `reduceOnly=true`. Final verification found position `0.000`, zero open BTCUSDT orders, both durable ledger records closed, `armed=false`, and `kill_switch=true`. The temporary acceptance API was stopped afterward. The next phase is operational production rollout/hardening; the canary does not itself authorize unattended live trading or a production cutover.
+The accepted Binance USD-M Futures boundary can run as a persistent host-local, fail-closed operator service. Strategy, research, AI, and simulation paths still cannot arm or execute live orders. The user service template is `deploy/systemd/trading-platform-live-user.service`, the production environment template is `deploy/binance-futures.env.example`, and host-local operational controls are in `scripts/live-operator.py`.
+
+The service binds only to `127.0.0.1:48070`, disarms before startup, performs a signed private read-only Binance preflight before serving, and disarms again whenever it stops. Operator tooling provides status, preflight, preview, reconciliation, emergency stop, disarm, and an explicitly confirmed one-shot order path. An ambiguous exchange outcome must be reconciled by request id rather than retried.
+
+Phase 8 real-money acceptance remains recorded in `phase-handoffs/PHASE-8B-HANDOFF.md`: the accepted canary returned BTCUSDT to position `0.000` with zero open orders. Production operator mode does not authorize unattended trading, automatic strategy execution, or profit-seeking decisions.

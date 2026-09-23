@@ -10,7 +10,7 @@ def test_phase7_health_and_readiness():
     ready = client.get("/ready")
 
     assert health.status_code == 200
-    assert health.json()["version"] == "0.8.1"
+    assert health.json()["version"] == "0.9.0"
     assert health.json()["live_trading"] is False
     assert ready.status_code == 200
     assert ready.json()["ready"] is True
