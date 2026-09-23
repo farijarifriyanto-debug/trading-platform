@@ -33,7 +33,7 @@ Production cutover: **NOT PERFORMED**
 - Auth smoke: unauthorized mutation **401**; authorized malformed request reached validation **422**.
 - Concurrent HTTP smoke: **200/200 requests PASS** against readiness/metrics with 20 workers.
 - Hardened Docker candidate: `/health`, `/ready`, security status **PASS**; image user = `app` (non-root).
-- GitHub PR CI: **PENDING** until branch push.
+- GitHub PR CI: **PASS**, run `35866219472` (16s).
 
 ## Locked boundaries
 
