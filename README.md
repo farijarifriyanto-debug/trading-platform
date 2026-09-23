@@ -376,4 +376,4 @@ Backtest and simulation results are research outputs, not profit guarantees.
 
 ## Next phase
 
-Phase 8A implements the fail-closed live execution boundary. Phase 8B adds Binance USD-M Futures support and a fresh signed read-only preflight attestation before host-local arming. The remaining acceptance step is an explicitly approved real-money canary: inspect the current account state, select one allowlisted order within the configured caps and exchange minimums, arm once, submit once, reconcile, and immediately disarm. No real-money canary or production cutover is performed automatically.
+Phase 8 real-money acceptance is complete: an explicitly approved Binance USD-M Futures canary entered 0.001 BTC at 1x isolated through the one-shot live boundary, then closed the same quantity with `reduceOnly=true`. Final verification found position `0.000`, zero open BTCUSDT orders, both durable ledger records closed, `armed=false`, and `kill_switch=true`. The temporary acceptance API was stopped afterward. The next phase is operational production rollout/hardening; the canary does not itself authorize unattended live trading or a production cutover.
