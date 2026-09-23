@@ -20,7 +20,7 @@ section{margin-top:12px}.ok{color:#8ee6a5}@media(max-width:850px){.grid{grid-tem
 @media(max-width:520px){.grid{grid-template-columns:1fr}.wide{grid-column:span 1}header{align-items:start;flex-direction:column}}
 </style></head>
 <body><main>
-<header><div><div class="muted">Research, simulation & paper execution control plane</div><h1>Trading Platform</h1></div><div class="badge"><span class="ok">●</span> PAPER ONLY · LIVE OFF</div></header>
+<header><div><div class="muted">Research, simulation, paper & live operator control plane</div><h1>Trading Platform</h1></div><div id="modeBadge" class="badge"><span class="ok">●</span> Loading mode…</div></header>
 <div class="grid">
 <div class="card"><div class="muted">Datasets</div><div id="datasetCount" class="metric">—</div></div>
 <div class="card"><div class="muted">Paper cash</div><div id="paperCash" class="metric">—</div></div>
@@ -40,7 +40,8 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"
 async function j(url){const r=await fetch(url);if(!r.ok)throw new Error(url+" "+r.status);return r.json()}
 function table(rows,cols){if(!rows.length)return '<span class="muted">No records yet</span>';return '<table><thead><tr>'+cols.map(c=>'<th>'+esc(c[0])+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td>'+esc(row[c[1]]??"")+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
 async function refresh(){try{
- const [m,d,e,p,a,c,w,q,r]=await Promise.all([j('/metrics'),j('/datasets'),j('/simulations/engines'),j('/paper/portfolio'),j('/paper/audit?limit=10'),j('/experiments/compare'),j('/workers/health'),j('/jobs?limit=10'),j('/ready')]);
+ const [m,d,e,p,a,c,w,q,r,h]=await Promise.all([j('/metrics'),j('/datasets'),j('/simulations/engines'),j('/paper/portfolio'),j('/paper/audit?limit=10'),j('/experiments/compare'),j('/workers/health'),j('/jobs?limit=10'),j('/ready'),j('/health')]);
+ modeBadge.innerHTML=h.live_capability_enabled?(h.live_armed?'<span class="ok">●</span> LIVE ARMED':'<span class="ok">●</span> LIVE CAPABILITY · DISARMED'):'<span class="ok">●</span> PAPER ONLY · LIVE OFF';
  datasetCount.textContent=m.dataset_count;paperCash.textContent=Number(m.paper_cash).toLocaleString(undefined,{maximumFractionDigits:2});
  positions.textContent=m.open_positions;experiments.textContent=m.completed_experiments+"/"+m.experiment_count;
  comparison.innerHTML=table(c,[['Engine','engine'],['Strategy','strategy'],['Start','start_cash'],['End','end_equity'],['Return','return_fraction'],['Trades','trades']]);

@@ -219,7 +219,7 @@ def health():
     live = live_service.status()
     return {
         "status": "ok",
-        "mode": "paper",
+        "mode": "live_operator" if live["capability_enabled"] else "paper",
         "live_trading": bool(live["capability_enabled"] and live["armed"]),
         "live_capability_enabled": live["capability_enabled"],
         "live_armed": live["armed"],
@@ -248,7 +248,7 @@ def readiness():
     ready = bool(state.get("ok")) and bool(live_db.get("ok")) and writable
     payload = {
         "ready": ready,
-        "mode": "paper",
+        "mode": "live_operator" if live_config.enabled else "paper",
         "live_trading": bool(live_config.enabled and live_control["armed"]),
         "live_capability_enabled": live_config.enabled,
         "live_armed": live_control["armed"],
