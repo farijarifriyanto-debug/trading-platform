@@ -2,7 +2,7 @@
 
 Modular, paper-first algorithmic trading and research platform. **Live trading remains disabled.**
 
-## Phase 6 status
+## Phase 7 status
 
 - CCXT public realtime ticker + OHLCV
 - SHA-256 content-addressed historical datasets
@@ -18,6 +18,12 @@ Modular, paper-first algorithmic trading and research platform. **Live trading r
 - Explicit robustness gate: `RESEARCH_PASS` / `REVIEW_REQUIRED`
 - FinRL-X isolated out-of-sample backtest integration
 - Model artifact SHA-256 provenance
+- SQLite WAL durable paper portfolio state
+- Durable research job queue with leases, retries, idempotency, cancellation, and stale-worker recovery
+- Mutation Bearer authentication gate, request-size limit, rate limit, and security headers
+- Readiness and Prometheus-compatible operational metrics
+- Verified backup/restore tooling with per-file SHA-256 manifest
+- Hardened systemd candidate units and Docker API candidate
 - FastAPI, Docker/Compose, GitHub Actions CI
 
 ## Architecture
@@ -193,18 +199,66 @@ curl -X POST http://127.0.0.1:8000/paper/market-orders \
 
 Paper orders never reach the exchange.
 
-## Persistence
+## Durable runtime and jobs
 
-Docker Compose persists `/data`:
+Mutable runtime state is now separated from immutable research artifacts:
 
 ```text
+/data/runtime.sqlite3        # paper cash + positions, WAL/FULL sync
+/data/jobs.sqlite3           # durable queue, leases/retry/recovery
 /data/paper-audit.jsonl
-/data/historical/datasets/*.json
-/data/historical/refs/*.json
-/data/simulations/*.json
-/data/experiments/*.json
-/data/lean-exports/*
+/data/historical/...         # immutable content-addressed datasets
+/data/simulations/...
+/data/experiments/...
+/data/ai-candidates/...
+/data/models/...
+/data/lean-exports/...
 ```
+
+Paper fills persist the portfolio immediately. The research worker queue supports idempotent enqueue, bounded retries, worker leases, stale RUNNING recovery, cancellation, and terminal results. Queueable workloads are experiment runs, AI candidate training, and FinRL-X evaluation; paper orders are deliberately not background/autonomous jobs.
+
+Run the durable worker with:
+
+```bash
+python workers/job_worker.py --poll-seconds 1 --lease-seconds 300
+```
+
+## Security and readiness
+
+Production candidate configuration sets `TRADING_REQUIRE_AUTH=1`. Mutating HTTP methods then require `Authorization: Bearer <TRADING_API_KEY>`. The API also enforces a configurable body-size ceiling and mutation rate limit and emits defensive browser headers.
+
+```bash
+curl http://127.0.0.1:8000/ready
+curl http://127.0.0.1:8000/security/status
+curl http://127.0.0.1:8000/metrics/prometheus
+```
+
+`/ready` verifies SQLite integrity and writable durable storage. No secret value is returned by the status endpoint.
+
+## Backup and recovery
+
+Create and verify a consistent snapshot:
+
+```bash
+python scripts/backup-data.py create /secure-backups/trading-platform.tar.gz --data-root /var/lib/trading-platform
+python scripts/backup-data.py verify /secure-backups/trading-platform.tar.gz
+```
+
+Restore drills must target an empty staging directory first:
+
+```bash
+python scripts/backup-data.py restore /secure-backups/trading-platform.tar.gz /tmp/trading-restore-drill
+```
+
+SQLite databases are copied through SQLite's backup API. Every other persisted file is covered by a SHA-256 manifest inside the archive.
+
+## Production candidate deployment
+
+`deploy/systemd/` contains separate API and durable-worker units. The worker has `PrivateNetwork=true`; external simulation/ML environments remain the isolated host-native venvs established in Phases 5-6. `deploy/trading-platform.env.example` documents the required environment without real secrets.
+
+Docker Compose remains an API-only candidate and now uses loopback binding, read-only root filesystem, dropped capabilities, no-new-privileges, tmpfs, and `/ready` health checks.
+
+Run `scripts/production-preflight.sh` before any candidate promotion. Phase 7 does **not** perform a production cutover or enable live trading.
 
 ## Safety gates
 
@@ -222,7 +276,7 @@ Docker Compose persists `/data`:
 
 ## Validation
 
-Phase 6 validation includes:
+Phase 7 validation includes:
 
 - unit/API suite
 - actual NautilusTrader 2.x worker execution
@@ -234,9 +288,15 @@ Phase 6 validation includes:
 - model artifact hashing and candidate provenance
 - real FinRL-X out-of-sample backtest worker execution
 - AI/FinRL safety assertions (`live_mode=false`, `execution_enabled=false`)
+- persistent paper-state restart test
+- durable queue retry/idempotency/stale-lease recovery tests
+- queue -> worker -> native experiment end-to-end test
+- backup -> verify -> restore recovery drill
+- authenticated HTTP mutation gate test
+- 200-request concurrent readiness/metrics stress smoke
 
 Backtest and simulation results are research outputs, not profit guarantees.
 
 ## Next phase
 
-Phase 7 focuses on production hardening: durable database-backed state, scheduler/worker supervision, monitoring and recovery, security review, deployment, and stress/integration acceptance. Live trading remains a separate later phase.
+Phase 7 completes the paper/research production-hardening roadmap. A future Phase 8 may add live trading only as a separately reviewed execution system with explicit credentials, tighter risk limits, kill switches, reconciliation, canary acceptance, and an explicit production cutover decision. Nothing in Phase 7 enables live orders.

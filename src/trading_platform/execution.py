@@ -1,6 +1,7 @@
 from .domain import Fill, OrderIntent, Side
 from .portfolio import Portfolio
 from .risk import RiskManager, RiskRejected
+from .state import PortfolioState
 
 
 class PaperBroker:
@@ -10,11 +11,13 @@ class PaperBroker:
         risk: RiskManager | None = None,
         fee_bps: float = 5.0,
         slippage_bps: float = 2.0,
+        state: PortfolioState | None = None,
     ):
         self.portfolio = portfolio or Portfolio()
         self.risk = risk or RiskManager()
         self.fee_bps = fee_bps
         self.slippage_bps = slippage_bps
+        self.state = state
 
     def submit(self, order: OrderIntent) -> Fill:
         direction = 1 if order.side == Side.BUY else -1
@@ -27,5 +30,14 @@ class PaperBroker:
             raise RiskRejected("insufficient paper cash")
 
         fill = Fill(order.symbol, order.side, order.quantity, price, fee)
+        before_cash = self.portfolio.cash
+        before_positions = dict(self.portfolio.positions)
         self.portfolio.apply(fill)
+        if self.state is not None:
+            try:
+                self.state.save_portfolio(self.portfolio)
+            except Exception:
+                self.portfolio.cash = before_cash
+                self.portfolio.positions = before_positions
+                raise
         return fill

@@ -20,5 +20,5 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
-      - run: python -m py_compile workers/nautilus_worker.py workers/ml_worker.py workers/finrlx_worker.py
+      - run: python -m py_compile workers/nautilus_worker.py workers/ml_worker.py workers/finrlx_worker.py workers/job_worker.py scripts/backup-data.py
       - run: pytest -q

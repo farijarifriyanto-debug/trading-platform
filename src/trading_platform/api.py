@@ -1,10 +1,11 @@
 import os
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .ai_research import AICandidateSpec, AICandidateStore, AIResearchWorkerService, RobustnessPolicy
@@ -21,20 +22,27 @@ from .execution import PaperBroker
 from .experiments import ExperimentSpec, ExperimentStore
 from .finrlx import FinRLXResearchService
 from .lean_export import LeanExporter
+from .jobs import DurableJobQueue
 from .market import CCXTMarketData
 from .metrics import collect_metrics
 from .paper import PaperTradingService
 from .registry import default_strategy_registry
 from .research import VectorBTResearch, VectorBTUnavailable
 from .risk import RiskRejected
+from .security import SecurityConfig, install_security_middleware
 from .simulation import SimulationPlanStore, SimulationSpec, default_simulation_registry
+from .state import RuntimeState
 from .sweep import run_sma_parameter_sweep
 from .workers import SimulationWorkerService, WorkerFailed, WorkerUnavailable
 
-app = FastAPI(title="Trading Platform", version="0.6.0")
+app = FastAPI(title="Trading Platform", version="0.7.0")
+security_config = SecurityConfig.from_env()
+install_security_middleware(app, security_config)
 
 data_root = Path(os.getenv("TRADING_DATA_DIR", "data"))
-paper = PaperBroker()
+runtime_state = RuntimeState(data_root / "runtime.sqlite3")
+job_queue = DurableJobQueue(data_root / "jobs.sqlite3")
+paper = PaperBroker(portfolio=runtime_state.load_portfolio(), state=runtime_state)
 audit = JSONLAuditLog(os.getenv("TRADING_AUDIT_PATH", str(data_root / "paper-audit.jsonl")))
 strategies = default_strategy_registry()
 paper_service = PaperTradingService(paper, audit, strategies)
@@ -181,8 +189,141 @@ def health():
         "status": "ok",
         "mode": "paper",
         "live_trading": False,
-        "version": "0.6.0",
+        "version": "0.7.0",
     }
+
+
+
+
+@app.get("/ready")
+def readiness():
+    state = runtime_state.health()
+    data_root.mkdir(parents=True, exist_ok=True)
+    writable = False
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=data_root, prefix=".ready-", delete=True
+        ) as probe:
+            probe.write(b"ok")
+            probe.flush()
+        writable = True
+    except OSError:
+        writable = False
+    ready = bool(state.get("ok")) and writable
+    payload = {
+        "ready": ready,
+        "mode": "paper",
+        "live_trading": False,
+        "runtime_state": state,
+        "data_root_writable": writable,
+        "jobs": job_queue.counts(),
+    }
+    if not ready:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+@app.get("/security/status")
+def security_status():
+    return {
+        "auth_required_for_mutations": security_config.require_auth,
+        "max_body_bytes": security_config.max_body_bytes,
+        "mutation_rate_per_minute": security_config.mutation_rate_per_minute,
+        "live_trading": False,
+    }
+
+
+@app.get("/jobs")
+def list_jobs(limit: int = Query(default=100, ge=1, le=1000), status: str | None = None):
+    return [asdict(job) for job in job_queue.list(limit=limit, status=status)]
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    try:
+        return asdict(job_queue.require(job_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    try:
+        return asdict(job_queue.cancel(job_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/jobs/experiments/{experiment_id}")
+def queue_experiment(experiment_id: str):
+    try:
+        experiment_store.require(experiment_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="experiment not found") from exc
+    job = job_queue.enqueue(
+        "experiment.run",
+        experiment_id,
+        idempotency_key=f"experiment.run:{experiment_id}",
+    )
+    return asdict(job)
+
+
+@app.post("/jobs/ai/{candidate_id}")
+def queue_ai_candidate(candidate_id: str):
+    try:
+        ai_candidate_store.require(candidate_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI candidate not found") from exc
+    job = job_queue.enqueue(
+        "ai.run",
+        candidate_id,
+        idempotency_key=f"ai.run:{candidate_id}",
+    )
+    return asdict(job)
+
+
+@app.post("/jobs/ai/{candidate_id}/finrlx")
+def queue_finrlx_candidate(candidate_id: str):
+    try:
+        record = ai_candidate_store.require(candidate_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI candidate not found") from exc
+    if record.status != "completed":
+        raise HTTPException(status_code=409, detail="AI candidate must be completed first")
+    job = job_queue.enqueue(
+        "ai.finrlx",
+        candidate_id,
+        idempotency_key=f"ai.finrlx:{candidate_id}",
+    )
+    return asdict(job)
+
+
+@app.get("/metrics/prometheus", include_in_schema=False)
+def prometheus_metrics():
+    platform = asdict(
+        collect_metrics(
+            dataset_store,
+            paper.portfolio,
+            audit,
+            experiment_store,
+            ai_candidate_store,
+        )
+    )
+    jobs = job_queue.counts()
+    lines = [
+        "# TYPE trading_platform_info gauge",
+        'trading_platform_info{mode="paper",live_trading="false"} 1',
+    ]
+    for key, value in platform.items():
+        if isinstance(value, (int, float)):
+            lines.append(f"trading_platform_{key} {value}")
+    for status, count in jobs.items():
+        lines.append(f'trading_platform_jobs{{status="{status}"}} {count}')
+    return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 @app.get("/strategies")
