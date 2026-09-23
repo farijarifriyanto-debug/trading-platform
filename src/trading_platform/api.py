@@ -36,7 +36,7 @@ from .state import RuntimeState
 from .sweep import run_sma_parameter_sweep
 from .workers import SimulationWorkerService, WorkerFailed, WorkerUnavailable
 
-app = FastAPI(title="Trading Platform", version="0.8.0")
+app = FastAPI(title="Trading Platform", version="0.8.1")
 security_config = SecurityConfig.from_env()
 live_config = LiveTradingConfig.from_env()
 if live_config.enabled:
@@ -193,7 +193,7 @@ def _live_broker() -> CCXTLiveBroker:
     if not live_config.enabled:
         raise HTTPException(status_code=409, detail="live execution capability is disabled")
     try:
-        return CCXTLiveBroker(live_config.exchange_id)
+        return CCXTLiveBroker(live_config.exchange_id, live_config.market_type)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -223,7 +223,7 @@ def health():
         "live_trading": bool(live["capability_enabled"] and live["armed"]),
         "live_capability_enabled": live["capability_enabled"],
         "live_armed": live["armed"],
-        "version": "0.8.0",
+        "version": "0.8.1",
     }
 
 
