@@ -28,6 +28,8 @@ section{margin-top:12px}.ok{color:#8ee6a5}@media(max-width:850px){.grid{grid-tem
 <div class="card"><div class="muted">Experiments</div><div id="experiments" class="metric">—</div></div>
 <section class="card wide"><h2>Experiment comparison</h2><div id="comparison">Loading…</div></section>
 <section class="card wide"><h2>Simulation workers</h2><pre id="workers">Loading…</pre></section>
+<section class="card wide"><h2>Durable jobs</h2><div id="jobs">Loading…</div></section>
+<section class="card wide"><h2>Readiness</h2><pre id="readiness">Loading…</pre></section>
 <section class="card wide"><h2>Historical datasets</h2><div id="datasets">Loading…</div></section>
 <section class="card wide"><h2>Simulation boundaries</h2><div id="engines">Loading…</div></section>
 <section class="card wide"><h2>Paper portfolio</h2><pre id="portfolio">Loading…</pre></section>
@@ -38,11 +40,13 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"
 async function j(url){const r=await fetch(url);if(!r.ok)throw new Error(url+" "+r.status);return r.json()}
 function table(rows,cols){if(!rows.length)return '<span class="muted">No records yet</span>';return '<table><thead><tr>'+cols.map(c=>'<th>'+esc(c[0])+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td>'+esc(row[c[1]]??"")+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
 async function refresh(){try{
- const [m,d,e,p,a,c,w]=await Promise.all([j('/metrics'),j('/datasets'),j('/simulations/engines'),j('/paper/portfolio'),j('/paper/audit?limit=10'),j('/experiments/compare'),j('/workers/health')]);
+ const [m,d,e,p,a,c,w,q,r]=await Promise.all([j('/metrics'),j('/datasets'),j('/simulations/engines'),j('/paper/portfolio'),j('/paper/audit?limit=10'),j('/experiments/compare'),j('/workers/health'),j('/jobs?limit=10'),j('/ready')]);
  datasetCount.textContent=m.dataset_count;paperCash.textContent=Number(m.paper_cash).toLocaleString(undefined,{maximumFractionDigits:2});
  positions.textContent=m.open_positions;experiments.textContent=m.completed_experiments+"/"+m.experiment_count;
  comparison.innerHTML=table(c,[['Engine','engine'],['Strategy','strategy'],['Start','start_cash'],['End','end_equity'],['Return','return_fraction'],['Trades','trades']]);
  workers.textContent=JSON.stringify(w,null,2);
+ jobs.innerHTML=table(q,[['Job','job_id'],['Kind','kind'],['Status','status'],['Attempts','attempts']]);
+ readiness.textContent=JSON.stringify(r,null,2);
  datasets.innerHTML=table(d,[['ID','dataset_id'],['Exchange','exchange'],['Symbol','symbol'],['TF','timeframe'],['Rows','count']]);
  engines.innerHTML=table(e,[['Engine','engine'],['Mode','mode'],['Execution','execution_enabled']]);
  portfolio.textContent=JSON.stringify(p,null,2);audit.textContent=JSON.stringify(a,null,2);

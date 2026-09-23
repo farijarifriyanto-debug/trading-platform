@@ -1,0 +1,27 @@
+[Unit]
+Description=Trading Platform Durable Research Worker
+After=trading-platform-api.service
+Requires=trading-platform-api.service
+
+[Service]
+Type=simple
+User=botadmin
+Group=botadmin
+WorkingDirectory=/opt/trading-platform/current
+EnvironmentFile=/etc/trading-platform.env
+ExecStart=/usr/bin/env /opt/trading-platform/venv/bin/python workers/job_worker.py --poll-seconds 1 --lease-seconds 300
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=330
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/trading-platform
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
