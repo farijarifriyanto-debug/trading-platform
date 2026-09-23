@@ -36,6 +36,7 @@ class FakeLiveBroker:
         self._minimum_cost = minimum_cost
         self.orders = []
         self.remote_open = []
+        self.reconciliation_symbols = []
 
     def is_contract(self, symbol):
         return self.market_type != "spot"
@@ -68,7 +69,11 @@ class FakeLiveBroker:
         return {"id": "exchange-1", "status": "closed", "clientOrderId": client_order_id}
 
     def reconciliation_orders(self, symbol=None):
-        return list(self.remote_open)
+        self.reconciliation_symbols.append(symbol)
+        return [
+            item for item in self.remote_open
+            if symbol is None or item.get("symbol") in {None, symbol}
+        ]
 
     def cancel_order(self, order_id, symbol=None):
         for index, item in enumerate(self.remote_open):
@@ -431,3 +436,20 @@ def test_ccxt_live_broker_handles_contract_position_and_reduce_only_sell():
 
     assert exchange.created[-1]["clientOrderId"] == "client123"
     assert exchange.created[-1]["reduceOnly"] is True
+
+
+def test_reconciliation_queries_each_allowlisted_symbol(tmp_path):
+    live, _ = service(
+        tmp_path,
+        allowed_symbols=("BTC/USD", "ETH/USD"),
+    )
+    broker = FakeLiveBroker()
+    broker.remote_open = [
+        {"id": "btc-1", "clientOrderId": "other-btc", "status": "closed", "symbol": "BTC/USD"},
+        {"id": "eth-1", "clientOrderId": "other-eth", "status": "closed", "symbol": "ETH/USD"},
+    ]
+
+    result = live.reconcile_orders(broker)
+
+    assert broker.reconciliation_symbols == ["BTC/USD", "ETH/USD"]
+    assert result["remote_orders"] == 2

@@ -36,7 +36,7 @@ from .state import RuntimeState
 from .sweep import run_sma_parameter_sweep
 from .workers import SimulationWorkerService, WorkerFailed, WorkerUnavailable
 
-app = FastAPI(title="Trading Platform", version="0.8.1")
+app = FastAPI(title="Trading Platform", version="0.9.0")
 security_config = SecurityConfig.from_env()
 live_config = LiveTradingConfig.from_env()
 if live_config.enabled:
@@ -223,7 +223,7 @@ def health():
         "live_trading": bool(live["capability_enabled"] and live["armed"]),
         "live_capability_enabled": live["capability_enabled"],
         "live_armed": live["armed"],
-        "version": "0.8.1",
+        "version": "0.9.0",
     }
 
 

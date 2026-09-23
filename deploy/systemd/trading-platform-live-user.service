@@ -1,0 +1,28 @@
+[Unit]
+Description=Trading Platform Live API (fail-closed operator service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading-platform
+EnvironmentFile=%h/.config/trading-platform/binance-futures.env
+ExecStartPre=%h/trading-platform/.venv/bin/python scripts/live-control.py disarm
+ExecStartPre=%h/trading-platform/.venv/bin/python scripts/live-preflight.py --private-read-check
+ExecStart=%h/trading-platform/.venv/bin/uvicorn trading_platform.api:app --host 127.0.0.1 --port 48070 --workers 1
+ExecStopPost=%h/trading-platform/.venv/bin/python scripts/live-control.py disarm
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=45
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/trading-platform
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

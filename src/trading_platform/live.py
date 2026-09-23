@@ -743,7 +743,12 @@ class LiveExecutionService:
     def reconcile_orders(self, broker: LiveBroker) -> dict[str, Any]:
         if broker.exchange_id != self.config.exchange_id:
             raise RiskRejected("exchange is not the configured live exchange")
-        remote = broker.reconciliation_orders()
+        remote_by_key: dict[str, dict[str, Any]] = {}
+        for symbol in self.config.allowed_symbols:
+            for item in broker.reconciliation_orders(symbol):
+                key = str(item.get("id") or item.get("clientOrderId") or len(remote_by_key))
+                remote_by_key[key] = item
+        remote = list(remote_by_key.values())
         by_client = {
             str(item.get("clientOrderId")): item
             for item in remote
@@ -775,10 +780,15 @@ class LiveExecutionService:
         cancelled = 0
         errors: list[str] = []
         local_client_ids = {record.client_order_id for record in self.state.list(limit=1000)}
+        remote: list[dict[str, Any]] = []
         try:
-            remote = broker.reconciliation_orders()
+            remote_by_key: dict[str, dict[str, Any]] = {}
+            for allowed_symbol in self.config.allowed_symbols:
+                for item in broker.reconciliation_orders(allowed_symbol):
+                    key = str(item.get("id") or item.get("clientOrderId") or len(remote_by_key))
+                    remote_by_key[key] = item
+            remote = list(remote_by_key.values())
         except Exception as exc:
-            remote = []
             errors.append(f"reconciliation: {str(exc)[-500:]}")
         for item in remote:
             client_id = str(item.get("clientOrderId") or "")
