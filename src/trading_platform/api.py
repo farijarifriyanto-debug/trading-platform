@@ -1,5 +1,7 @@
 import os
 from dataclasses import asdict
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -7,17 +9,29 @@ from pydantic import BaseModel, Field
 
 from .audit import JSONLAuditLog
 from .backtest import run_sma_backtest
+from .datasets import (
+    DatasetIntegrityError,
+    HistoricalDataService,
+    HistoricalDatasetStore,
+)
 from .domain import OrderIntent, Side
 from .execution import PaperBroker
 from .market import CCXTMarketData
 from .paper import PaperTradingService
+from .registry import default_strategy_registry
 from .research import VectorBTResearch, VectorBTUnavailable
 from .risk import RiskRejected
+from .sweep import run_sma_parameter_sweep
 
-app = FastAPI(title="Trading Platform", version="0.2.0")
+app = FastAPI(title="Trading Platform", version="0.3.0")
+
+data_root = Path(os.getenv("TRADING_DATA_DIR", "data"))
 paper = PaperBroker()
-audit = JSONLAuditLog(os.getenv("TRADING_AUDIT_PATH", "data/paper-audit.jsonl"))
-paper_service = PaperTradingService(paper, audit)
+audit = JSONLAuditLog(os.getenv("TRADING_AUDIT_PATH", str(data_root / "paper-audit.jsonl")))
+strategies = default_strategy_registry()
+paper_service = PaperTradingService(paper, audit, strategies)
+dataset_store = HistoricalDatasetStore(data_root / "historical")
+historical_data = HistoricalDataService(dataset_store)
 
 
 class PaperOrder(BaseModel):
@@ -40,6 +54,10 @@ class StrategyStepRequest(BaseModel):
     quantity: float = Field(default=0.001, gt=0)
     timeframe: str = "1h"
     limit: int = Field(default=200, ge=20, le=1000)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class SMAFastSlowRequest(StrategyStepRequest):
     fast: int = Field(default=5, gt=0)
     slow: int = Field(default=20, gt=1)
 
@@ -60,11 +78,39 @@ class VectorBTRequest(BaseModel):
     fees: float = Field(default=0.0005, ge=0)
 
 
+class DatasetCaptureRequest(BaseModel):
+    exchange: str = "kraken"
+    symbol: str = "BTC/USD"
+    timeframe: str = "1h"
+    limit: int = Field(default=200, ge=1, le=1000)
+    refresh: bool = False
+
+
+class SMASweepRequest(BaseModel):
+    dataset_id: str | None = None
+    prices: list[float] | None = None
+    symbol: str = "TEST/USD"
+    quantity: float = Field(default=1.0, gt=0)
+    fast_values: list[int] = Field(default_factory=lambda: [3, 5, 10], min_length=1)
+    slow_values: list[int] = Field(default_factory=lambda: [20, 50], min_length=1)
+
+
 def _market(exchange: str) -> CCXTMarketData:
     try:
         return CCXTMarketData(exchange)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _load_dataset(dataset_id: str):
+    try:
+        return dataset_store.load(dataset_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="dataset not found") from exc
+    except DatasetIntegrityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.exception_handler(RiskRejected)
@@ -74,7 +120,17 @@ async def risk_rejected_handler(_, exc: RiskRejected):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "mode": "paper", "live_trading": False, "version": "0.2.0"}
+    return {
+        "status": "ok",
+        "mode": "paper",
+        "live_trading": False,
+        "version": "0.3.0",
+    }
+
+
+@app.get("/strategies")
+def strategy_catalog():
+    return strategies.catalog()
 
 
 @app.get("/market/{exchange}/ticker")
@@ -102,6 +158,37 @@ def market_ohlcv(
         raise HTTPException(status_code=502, detail=f"market data unavailable: {exc}") from exc
 
 
+@app.post("/datasets/ccxt")
+def capture_dataset(req: DatasetCaptureRequest):
+    try:
+        dataset, cache_hit = historical_data.snapshot(
+            _market(req.exchange),
+            req.symbol,
+            req.timeframe,
+            req.limit,
+            req.refresh,
+        )
+        return {**dataset.metadata(), "cache_hit": cache_hit}
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=502, detail=f"dataset capture failed: {exc}") from exc
+
+
+@app.get("/datasets")
+def list_datasets():
+    return dataset_store.list_metadata()
+
+
+@app.get("/datasets/{dataset_id}")
+def get_dataset(dataset_id: str):
+    dataset = _load_dataset(dataset_id)
+    return {
+        **dataset.metadata(),
+        "candles": [asdict(candle) for candle in dataset.candles],
+    }
+
+
 @app.post("/paper/orders")
 def paper_order(req: PaperOrder):
     fill = paper.submit(OrderIntent(req.symbol, req.side, req.quantity, req.price))
@@ -113,22 +200,52 @@ def paper_order(req: PaperOrder):
             "fill": asdict(fill),
         },
     )
-    return {"fill": asdict(fill), "cash": paper.portfolio.cash, "positions": paper.portfolio.positions}
+    return {
+        "fill": asdict(fill),
+        "cash": paper.portfolio.cash,
+        "positions": paper.portfolio.positions,
+    }
 
 
 @app.post("/paper/market-orders")
 def paper_market_order(req: MarketPaperOrder):
     try:
         fill = paper_service.market_order(_market(req.exchange), req.symbol, req.side, req.quantity)
-        return {"fill": asdict(fill), "cash": paper.portfolio.cash, "positions": paper.portfolio.positions}
+        return {
+            "fill": asdict(fill),
+            "cash": paper.portfolio.cash,
+            "positions": paper.portfolio.positions,
+        }
     except Exception as exc:
         if isinstance(exc, (HTTPException, RiskRejected)):
             raise
         raise HTTPException(status_code=502, detail=f"paper market order failed: {exc}") from exc
 
 
+@app.post("/paper/strategies/{strategy_name}/step")
+def paper_strategy_step(strategy_name: str, req: StrategyStepRequest):
+    try:
+        return asdict(
+            paper_service.strategy_step(
+                _market(req.exchange),
+                req.symbol,
+                strategy_name,
+                req.parameters,
+                req.quantity,
+                req.timeframe,
+                req.limit,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        if isinstance(exc, (HTTPException, RiskRejected)):
+            raise
+        raise HTTPException(status_code=502, detail=f"strategy step failed: {exc}") from exc
+
+
 @app.post("/paper/strategy/sma/step")
-def paper_sma_step(req: StrategyStepRequest):
+def paper_sma_step(req: SMAFastSlowRequest):
     try:
         return asdict(
             paper_service.sma_step(
@@ -162,10 +279,53 @@ def backtest(req: BacktestRequest):
     return asdict(run_sma_backtest(req.prices, req.symbol, req.quantity, req.fast, req.slow))
 
 
+@app.post("/research/sweeps/sma")
+def sma_sweep(req: SMASweepRequest):
+    if (req.dataset_id is None) == (req.prices is None):
+        raise HTTPException(
+            status_code=422,
+            detail="provide exactly one of dataset_id or prices",
+        )
+
+    dataset_id = req.dataset_id
+    symbol = req.symbol
+    if dataset_id is not None:
+        dataset = _load_dataset(dataset_id)
+        prices = [candle.close for candle in dataset.candles]
+        symbol = dataset.symbol
+    else:
+        prices = list(req.prices or [])
+
+    try:
+        report = run_sma_parameter_sweep(
+            prices=prices,
+            fast_values=req.fast_values,
+            slow_values=req.slow_values,
+            symbol=symbol,
+            quantity=req.quantity,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {
+        "dataset_id": dataset_id,
+        "symbol": symbol,
+        "evaluated": report.evaluated,
+        "skipped": report.skipped,
+        "results": [asdict(result) for result in report.results],
+    }
+
+
 @app.post("/research/vectorbt/sma")
 def vectorbt_sma(req: VectorBTRequest):
     try:
-        result = VectorBTResearch().sma_cross(req.prices, req.fast, req.slow, req.initial_cash, req.fees)
+        result = VectorBTResearch().sma_cross(
+            req.prices,
+            req.fast,
+            req.slow,
+            req.initial_cash,
+            req.fees,
+        )
         return asdict(result)
     except VectorBTUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
