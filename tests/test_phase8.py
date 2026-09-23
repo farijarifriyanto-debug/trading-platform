@@ -373,11 +373,14 @@ def test_ccxt_live_broker_handles_contract_position_and_reduce_only_sell():
     class Exchange:
         def __init__(self):
             self.created = None
+            self.loaded = False
 
         def load_markets(self):
+            self.loaded = True
             return {}
 
         def market(self, symbol):
+            assert self.loaded is True
             return {
                 "base": "BTC",
                 "quote": "USDT",

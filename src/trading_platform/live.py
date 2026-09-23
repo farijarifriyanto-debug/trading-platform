@@ -456,10 +456,13 @@ class CCXTLiveBroker:
             }
         )
 
-    def is_contract(self, symbol: str) -> bool:
+    def _market(self, symbol: str) -> dict[str, Any]:
         if hasattr(self.exchange, "load_markets"):
             self.exchange.load_markets()
-        return bool(self.exchange.market(symbol).get("contract"))
+        return self.exchange.market(symbol)
+
+    def is_contract(self, symbol: str) -> bool:
+        return bool(self._market(symbol).get("contract"))
 
     def position_mode_hedged(self) -> bool:
         if self.market_type == "spot":
@@ -502,7 +505,7 @@ class CCXTLiveBroker:
         return self._balance_cache
 
     def position_quantity(self, symbol: str) -> float:
-        market = self.exchange.market(symbol)
+        market = self._market(symbol)
         if market.get("contract"):
             positions = self.exchange.fetch_positions([symbol])
             signed = 0.0
@@ -521,7 +524,7 @@ class CCXTLiveBroker:
         return max(0.0, float(total or 0.0))
 
     def available_quote_balance(self, symbol: str) -> float:
-        market = self.exchange.market(symbol)
+        market = self._market(symbol)
         quote = market["quote"]
         balance = self._balance()
         free = balance.get("free", {}).get(quote)
@@ -530,7 +533,7 @@ class CCXTLiveBroker:
         return max(0.0, float(free or 0.0))
 
     def available_base_balance(self, symbol: str) -> float:
-        market = self.exchange.market(symbol)
+        market = self._market(symbol)
         if market.get("contract"):
             return max(0.0, self.position_quantity(symbol))
         base = market["base"]
@@ -546,7 +549,7 @@ class CCXTLiveBroker:
         normalized = float(self.exchange.amount_to_precision(symbol, quantity))
         if normalized <= 0:
             raise RiskRejected("quantity rounds to zero at exchange precision")
-        market = self.exchange.market(symbol)
+        market = self._market(symbol)
         limits = market.get("limits", {}).get("amount", {})
         minimum = limits.get("min")
         maximum = limits.get("max")
@@ -557,7 +560,7 @@ class CCXTLiveBroker:
         return normalized
 
     def minimum_cost(self, symbol: str) -> float | None:
-        market = self.exchange.market(symbol)
+        market = self._market(symbol)
         minimum = market.get("limits", {}).get("cost", {}).get("min")
         return float(minimum) if minimum is not None else None
 
