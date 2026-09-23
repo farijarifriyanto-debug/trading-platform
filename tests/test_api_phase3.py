@@ -14,7 +14,7 @@ def test_health_reports_paper_default_v08():
         "live_trading": False,
         "live_capability_enabled": False,
         "live_armed": False,
-        "version": "0.8.0",
+        "version": "0.8.1",
     }
 
 

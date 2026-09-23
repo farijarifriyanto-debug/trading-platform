@@ -14,6 +14,7 @@ from trading_platform.security import SecurityConfig, install_security_middlewar
 
 class FakeLiveBroker:
     exchange_id = "kraken"
+    market_type = "spot"
 
     def __init__(
         self,
@@ -23,14 +24,24 @@ class FakeLiveBroker:
         quote_balance=10_000.0,
         timestamp=None,
         fail_submit=False,
+        hedged=False,
+        minimum_cost=None,
     ):
         self.price = price
         self.position = position
         self.quote_balance = quote_balance
         self.timestamp = timestamp if timestamp is not None else int(time.time() * 1000)
         self.fail_submit = fail_submit
+        self.hedged = hedged
+        self._minimum_cost = minimum_cost
         self.orders = []
         self.remote_open = []
+
+    def is_contract(self, symbol):
+        return self.market_type != "spot"
+
+    def position_mode_hedged(self):
+        return self.hedged
 
     def quote(self, symbol):
         return Quote(self.exchange_id, symbol, self.price - 1, self.price, self.price, self.timestamp)
@@ -46,6 +57,9 @@ class FakeLiveBroker:
 
     def normalize_quantity(self, symbol, quantity):
         return round(quantity, 3)
+
+    def minimum_cost(self, symbol):
+        return self._minimum_cost
 
     def place_market_order(self, symbol, side, quantity, client_order_id):
         self.orders.append((symbol, side.value, quantity, client_order_id))
@@ -67,6 +81,7 @@ def config(**overrides):
     values = dict(
         enabled=True,
         exchange_id="kraken",
+        market_type="spot",
         allowed_symbols=("BTC/USD",),
         max_order_notional=100.0,
         max_position_notional=500.0,
@@ -313,3 +328,106 @@ def test_live_config_refuses_non_one_shot_when_enabled(monkeypatch):
 
     with pytest.raises(RuntimeError, match="one-shot"):
         LiveTradingConfig.from_env()
+
+
+def test_live_rejects_hedged_position_mode_and_exchange_minimum_cost(tmp_path):
+    live, state = service(tmp_path / "hedged")
+    state.arm(60)
+    with pytest.raises(RiskRejected, match="one-way"):
+        live.submit_market(
+            FakeLiveBroker(hedged=True), "request_0013", "BTC/USD", Side.BUY, 1
+        )
+
+    live2, state2 = service(tmp_path / "mincost")
+    state2.arm(60)
+    with pytest.raises(RiskRejected, match="minimum cost"):
+        live2.submit_market(
+            FakeLiveBroker(price=50, minimum_cost=60),
+            "request_0014",
+            "BTC/USD",
+            Side.BUY,
+            1,
+        )
+
+
+def test_live_config_accepts_binance_future_market(monkeypatch):
+    monkeypatch.setenv("TRADING_LIVE_EXCHANGE", "binance")
+    monkeypatch.setenv("TRADING_LIVE_MARKET_TYPE", "future")
+    monkeypatch.setenv("TRADING_LIVE_ALLOWED_SYMBOLS", "BTC/USDT:USDT")
+
+    cfg = LiveTradingConfig.from_env()
+
+    assert cfg.exchange_id == "binance"
+    assert cfg.market_type == "future"
+    assert cfg.allowed_symbols == ("BTC/USDT:USDT",)
+
+
+def test_ccxt_live_broker_handles_contract_position_and_reduce_only_sell():
+    from trading_platform.live import CCXTLiveBroker
+
+    class Exchange:
+        def __init__(self):
+            self.created = None
+
+        def load_markets(self):
+            return {}
+
+        def market(self, symbol):
+            return {
+                "base": "BTC",
+                "quote": "USDT",
+                "contract": True,
+                "contractSize": 1.0,
+                "limits": {"amount": {"min": 0.001, "max": 1000}, "cost": {"min": 50}},
+            }
+
+        def fetch_position_mode(self):
+            return {"hedged": False}
+
+        def sapiGetAccountApiRestrictions(self):
+            return {
+                "enableReading": True,
+                "enableFutures": True,
+                "enableWithdrawals": False,
+                "ipRestrict": True,
+                "enableSpotAndMarginTrading": False,
+            }
+
+        def fetch_positions(self, symbols):
+            return [
+                {
+                    "symbol": symbols[0],
+                    "side": "long",
+                    "contracts": 0.002,
+                    "contractSize": 1.0,
+                }
+            ]
+
+        def fetch_balance(self):
+            return {"free": {"USDT": 500.0}, "total": {"USDT": 500.0}}
+
+        def amount_to_precision(self, symbol, quantity):
+            return f"{quantity:.3f}"
+
+        def create_order(self, symbol, order_type, side, quantity, price, params):
+            self.created = (symbol, order_type, side, quantity, price, params)
+            return {"id": "future-1", "status": "closed", "clientOrderId": params["clientOrderId"]}
+
+    exchange = Exchange()
+    broker = CCXTLiveBroker("binance", "future", exchange=exchange)
+
+    assert broker.position_mode_hedged() is False
+    assert broker.private_security_posture() == {
+        "reading": True,
+        "futures": True,
+        "withdrawals": False,
+        "ip_restricted": True,
+        "spot_margin": False,
+    }
+    assert broker.position_quantity("BTC/USDT:USDT") == pytest.approx(0.002)
+    assert broker.available_base_balance("BTC/USDT:USDT") == pytest.approx(0.002)
+    assert broker.minimum_cost("BTC/USDT:USDT") == 50
+    broker.place_market_order("BTC/USDT:USDT", Side.SELL, 0.001, "client123")
+
+    assert exchange.created[-1]["clientOrderId"] == "client123"
+    assert exchange.created[-1]["reduceOnly"] is True

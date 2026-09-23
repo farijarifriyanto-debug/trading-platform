@@ -33,6 +33,7 @@ def _truthy(value: str | None, default: bool = False) -> bool:
 class LiveTradingConfig:
     enabled: bool = False
     exchange_id: str = "kraken"
+    market_type: str = "spot"
     allowed_symbols: tuple[str, ...] = ("BTC/USD",)
     max_order_notional: float = 100.0
     max_position_notional: float = 500.0
@@ -51,6 +52,7 @@ class LiveTradingConfig:
         config = cls(
             enabled=_truthy(os.getenv("TRADING_LIVE_ENABLED"), False),
             exchange_id=os.getenv("TRADING_LIVE_EXCHANGE", "kraken").strip().lower(),
+            market_type=os.getenv("TRADING_LIVE_MARKET_TYPE", "spot").strip().lower(),
             allowed_symbols=symbols,
             max_order_notional=float(os.getenv("TRADING_LIVE_MAX_ORDER_NOTIONAL", "100")),
             max_position_notional=float(os.getenv("TRADING_LIVE_MAX_POSITION_NOTIONAL", "500")),
@@ -61,6 +63,8 @@ class LiveTradingConfig:
         )
         if not config.allowed_symbols:
             raise RuntimeError("TRADING_LIVE_ALLOWED_SYMBOLS must not be empty")
+        if config.market_type not in {"spot", "future", "delivery"}:
+            raise RuntimeError("TRADING_LIVE_MARKET_TYPE must be spot, future, or delivery")
         if min(
             config.max_order_notional,
             config.max_position_notional,
@@ -95,8 +99,13 @@ class LiveOrder:
 
 class LiveBroker(Protocol):
     exchange_id: str
+    market_type: str
 
     def quote(self, symbol: str) -> Quote: ...
+
+    def is_contract(self, symbol: str) -> bool: ...
+
+    def position_mode_hedged(self) -> bool: ...
 
     def position_quantity(self, symbol: str) -> float: ...
 
@@ -105,6 +114,8 @@ class LiveBroker(Protocol):
     def available_base_balance(self, symbol: str) -> float: ...
 
     def normalize_quantity(self, symbol: str, quantity: float) -> float: ...
+
+    def minimum_cost(self, symbol: str) -> float | None: ...
 
     def place_market_order(
         self, symbol: str, side: Side, quantity: float, client_order_id: str
@@ -414,8 +425,9 @@ class LiveStateStore:
 class CCXTLiveBroker:
     """Private CCXT boundary. Construction requires credentials; no secret is exposed."""
 
-    def __init__(self, exchange_id: str, exchange: Any | None = None):
+    def __init__(self, exchange_id: str, market_type: str = "spot", exchange: Any | None = None):
         self.exchange_id = exchange_id
+        self.market_type = market_type
         self._balance_cache: dict[str, Any] | None = None
         if exchange is not None:
             self.exchange = exchange
@@ -437,8 +449,35 @@ class CCXTLiveBroker:
                 "secret": secret,
                 "password": os.getenv("TRADING_LIVE_EXCHANGE_PASSWORD") or None,
                 "enableRateLimit": True,
+                "options": {
+                    "defaultType": market_type,
+                    "adjustForTimeDifference": True,
+                },
             }
         )
+
+    def is_contract(self, symbol: str) -> bool:
+        if hasattr(self.exchange, "load_markets"):
+            self.exchange.load_markets()
+        return bool(self.exchange.market(symbol).get("contract"))
+
+    def position_mode_hedged(self) -> bool:
+        if self.market_type == "spot":
+            return False
+        result = self.exchange.fetch_position_mode()
+        return bool(result.get("hedged"))
+
+    def private_security_posture(self) -> dict[str, bool] | None:
+        if self.exchange_id != "binance":
+            return None
+        restrictions = self.exchange.sapiGetAccountApiRestrictions()
+        return {
+            "reading": bool(restrictions.get("enableReading")),
+            "futures": bool(restrictions.get("enableFutures")),
+            "withdrawals": bool(restrictions.get("enableWithdrawals")),
+            "ip_restricted": bool(restrictions.get("ipRestrict")),
+            "spot_margin": bool(restrictions.get("enableSpotAndMarginTrading")),
+        }
 
     def quote(self, symbol: str) -> Quote:
         raw = self.exchange.fetch_ticker(symbol)
@@ -464,6 +503,16 @@ class CCXTLiveBroker:
 
     def position_quantity(self, symbol: str) -> float:
         market = self.exchange.market(symbol)
+        if market.get("contract"):
+            positions = self.exchange.fetch_positions([symbol])
+            signed = 0.0
+            for position in positions:
+                contracts = float(position.get("contracts") or 0.0)
+                contract_size = float(position.get("contractSize") or market.get("contractSize") or 1.0)
+                quantity = contracts * contract_size
+                side = str(position.get("side") or "").lower()
+                signed += -quantity if side == "short" else quantity
+            return signed
         base = market["base"]
         balance = self._balance()
         total = balance.get("total", {}).get(base)
@@ -482,6 +531,8 @@ class CCXTLiveBroker:
 
     def available_base_balance(self, symbol: str) -> float:
         market = self.exchange.market(symbol)
+        if market.get("contract"):
+            return max(0.0, self.position_quantity(symbol))
         base = market["base"]
         balance = self._balance()
         free = balance.get("free", {}).get(base)
@@ -505,16 +556,24 @@ class CCXTLiveBroker:
             raise RiskRejected("quantity exceeds exchange maximum")
         return normalized
 
+    def minimum_cost(self, symbol: str) -> float | None:
+        market = self.exchange.market(symbol)
+        minimum = market.get("limits", {}).get("cost", {}).get("min")
+        return float(minimum) if minimum is not None else None
+
     def place_market_order(
         self, symbol: str, side: Side, quantity: float, client_order_id: str
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {"clientOrderId": client_order_id}
+        if self.is_contract(symbol) and side == Side.SELL:
+            params["reduceOnly"] = True
         return self.exchange.create_order(
             symbol,
             "market",
             side.value,
             quantity,
             None,
-            {"clientOrderId": client_order_id},
+            params,
         )
 
     def reconciliation_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
@@ -550,6 +609,7 @@ class LiveExecutionService:
         return {
             "capability_enabled": self.config.enabled,
             "exchange": self.config.exchange_id,
+            "market_type": self.config.market_type,
             "allowed_symbols": list(self.config.allowed_symbols),
             "max_order_notional": self.config.max_order_notional,
             "max_position_notional": self.config.max_position_notional,
@@ -583,6 +643,10 @@ class LiveExecutionService:
             raise RiskRejected("live execution is disarmed")
         if broker.exchange_id != self.config.exchange_id:
             raise RiskRejected("exchange is not the configured live exchange")
+        if broker.market_type != self.config.market_type:
+            raise RiskRejected("market type is not the configured live market type")
+        if broker.position_mode_hedged():
+            raise RiskRejected("hedged position mode is not supported; one-way mode is required")
         if symbol not in self.config.allowed_symbols:
             raise RiskRejected("symbol is not allowlisted")
         if quantity <= 0:
@@ -598,6 +662,9 @@ class LiveExecutionService:
             raise RiskRejected("live quote is stale")
         price = quote.executable_price(side)
         notional = price * quantity
+        minimum_cost = broker.minimum_cost(symbol)
+        if minimum_cost is not None and notional < minimum_cost:
+            raise RiskRejected("order notional is below exchange minimum cost")
 
         current_position = broker.position_quantity(symbol)
         self.risk.validate(OrderIntent(symbol, side, quantity, price), current_position)

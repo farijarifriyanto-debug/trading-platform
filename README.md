@@ -214,13 +214,23 @@ python scripts/live-control.py status
 python scripts/live-control.py arm --ttl 60 --confirm ENABLE_REAL_MONEY_ORDER_WINDOW
 ```
 
-The private preflight performs read-only credential/exchange checks and never creates an order. A live order still requires authenticated HTTP, an allowlisted symbol, exchange precision/minimum validation, a fresh quote, deterministic risk limits, available balance, a daily notional budget, and a unique request id. The arm is consumed atomically before the exchange call, so one arm authorizes at most one new live order.
+The private preflight performs read-only credential/exchange checks and never creates an order. A successful private preflight writes a short-lived, non-secret attestation tied to the exact live configuration; host-local arming refuses stale or mismatched attestations. A live order still requires authenticated HTTP, an allowlisted symbol, one-way position mode for derivatives, exchange precision/minimum validation, a fresh quote, deterministic risk limits, available balance, a daily notional budget, and a unique request id. The arm is consumed atomically before the exchange call, so one arm authorizes at most one new live order.
+
+For Binance USD-M Futures, CCXT uses unified contract symbols and `future` market type:
+
+```text
+TRADING_LIVE_EXCHANGE=binance
+TRADING_LIVE_MARKET_TYPE=future
+TRADING_LIVE_ALLOWED_SYMBOLS=BTC/USDT:USDT
+```
+
+The Binance adapter reads the current one-way/hedged position mode and rejects hedged mode. The private preflight also requires API reading permission, Futures permission for the Futures profile, IP restriction enabled, and withdrawals disabled. Sell orders on contract markets are sent as `reduceOnly`, so this Phase 8 boundary cannot use a sell request to open a short position.
 
 ```bash
 curl -X POST http://127.0.0.1:48070/live/orders \
   -H 'Authorization: Bearer <TRADING_API_KEY>' \
   -H 'content-type: application/json' \
-  -d '{"request_id":"manual_canary_001","symbol":"BTC/USD","side":"buy","quantity":0.0001}'
+  -d '{"request_id":"manual_canary_001","symbol":"BTC/USDT:USDT","side":"buy","quantity":0.001}'
 ```
 
 Do not run that request until a real-money canary is separately approved. Reusing the same request id cannot create a second order. If an exchange call times out after reservation, the ledger records `unknown` and refuses to retry that request id until reconciliation.
@@ -366,4 +376,4 @@ Backtest and simulation results are research outputs, not profit guarantees.
 
 ## Next phase
 
-Phase 8A implements and tests the live execution safety boundary while keeping it disabled. Phase 8B is a separately approved real-exchange canary: provision a least-privilege exchange key, run the private read-only preflight, inspect balances/open orders, select a deliberately tiny canary order within the configured caps, arm once, submit once, reconcile, and immediately disarm. That canary and any production cutover are **not performed automatically** by this phase.
+Phase 8A implements the fail-closed live execution boundary. Phase 8B adds Binance USD-M Futures support and a fresh signed read-only preflight attestation before host-local arming. The remaining acceptance step is an explicitly approved real-money canary: inspect the current account state, select one allowlisted order within the configured caps and exchange minimums, arm once, submit once, reconcile, and immediately disarm. No real-money canary or production cutover is performed automatically.
