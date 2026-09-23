@@ -11,6 +11,8 @@ services:
       TRADING_API_KEY: "${TRADING_API_KEY:-}"
       TRADING_MAX_BODY_BYTES: "${TRADING_MAX_BODY_BYTES:-2097152}"
       TRADING_MUTATION_RATE_PER_MINUTE: "${TRADING_MUTATION_RATE_PER_MINUTE:-120}"
+      # Docker candidate is intentionally paper/research-only.
+      TRADING_LIVE_ENABLED: "0"
     volumes:
       - trading-data:/data
     read_only: true

@@ -33,8 +33,13 @@ def create_backup(data_root: str | Path, archive: str | Path) -> Path:
                 if item.name.endswith(("-wal", "-shm")) or item.name == ".ready-probe":
                     continue
                 target = stage / item.name
-                if item.name in {"runtime.sqlite3", "jobs.sqlite3"} and item.is_file():
+                if item.name in {"runtime.sqlite3", "jobs.sqlite3", "live.sqlite3"} and item.is_file():
                     _sqlite_snapshot(item, target)
+                    if item.name == "live.sqlite3":
+                        with sqlite3.connect(target) as conn:
+                            conn.execute(
+                                "UPDATE live_control SET kill_switch=1, armed_until=NULL WHERE id=1"
+                            )
                 elif item.is_dir():
                     shutil.copytree(item, target)
                 elif item.is_file():

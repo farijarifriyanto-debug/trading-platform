@@ -1,0 +1,315 @@
+import time
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from trading_platform.audit import MemoryAuditLog
+from trading_platform.domain import Side
+from trading_platform.live import LiveExecutionService, LiveStateStore, LiveTradingConfig
+from trading_platform.market import Quote
+from trading_platform.risk import RiskRejected
+from trading_platform.security import SecurityConfig, install_security_middleware
+
+
+class FakeLiveBroker:
+    exchange_id = "kraken"
+
+    def __init__(
+        self,
+        *,
+        price=50.0,
+        position=0.0,
+        quote_balance=10_000.0,
+        timestamp=None,
+        fail_submit=False,
+    ):
+        self.price = price
+        self.position = position
+        self.quote_balance = quote_balance
+        self.timestamp = timestamp if timestamp is not None else int(time.time() * 1000)
+        self.fail_submit = fail_submit
+        self.orders = []
+        self.remote_open = []
+
+    def quote(self, symbol):
+        return Quote(self.exchange_id, symbol, self.price - 1, self.price, self.price, self.timestamp)
+
+    def position_quantity(self, symbol):
+        return self.position
+
+    def available_quote_balance(self, symbol):
+        return self.quote_balance
+
+    def available_base_balance(self, symbol):
+        return self.position
+
+    def normalize_quantity(self, symbol, quantity):
+        return round(quantity, 3)
+
+    def place_market_order(self, symbol, side, quantity, client_order_id):
+        self.orders.append((symbol, side.value, quantity, client_order_id))
+        if self.fail_submit:
+            raise TimeoutError("exchange timeout")
+        return {"id": "exchange-1", "status": "closed", "clientOrderId": client_order_id}
+
+    def reconciliation_orders(self, symbol=None):
+        return list(self.remote_open)
+
+    def cancel_order(self, order_id, symbol=None):
+        for index, item in enumerate(self.remote_open):
+            if item.get("id") == order_id:
+                return self.remote_open.pop(index)
+        raise KeyError(order_id)
+
+
+def config(**overrides):
+    values = dict(
+        enabled=True,
+        exchange_id="kraken",
+        allowed_symbols=("BTC/USD",),
+        max_order_notional=100.0,
+        max_position_notional=500.0,
+        max_daily_notional=100.0,
+        max_quote_age_ms=15_000,
+        arm_ttl_seconds=300,
+        one_shot_arm=True,
+    )
+    values.update(overrides)
+    return LiveTradingConfig(**values)
+
+
+def service(tmp_path, **overrides):
+    state = LiveStateStore(tmp_path / "live.sqlite3")
+    return LiveExecutionService(config(**overrides), state, MemoryAuditLog()), state
+
+
+def test_live_state_defaults_fail_closed(tmp_path):
+    state = LiveStateStore(tmp_path / "live.sqlite3")
+
+    status = state.status()
+
+    assert status["armed"] is False
+    assert status["kill_switch"] is True
+    assert state.health()["ok"] is True
+
+
+def test_live_order_requires_explicit_arm(tmp_path):
+    live, _ = service(tmp_path)
+
+    with pytest.raises(RiskRejected, match="disarmed"):
+        live.submit_market(FakeLiveBroker(), "request_0001", "BTC/USD", Side.BUY, 1)
+
+
+def test_live_order_is_one_shot_idempotent_and_uses_short_client_id(tmp_path):
+    live, state = service(tmp_path)
+    broker = FakeLiveBroker()
+    state.arm(60)
+
+    first = live.submit_market(broker, "request_0002", "BTC/USD", Side.BUY, 1)
+    retry = live.submit_market(broker, "request_0002", "BTC/USD", Side.BUY, 1)
+
+    assert first.status == "closed"
+    assert retry == first
+    assert len(broker.orders) == 1
+    assert len(first.client_order_id) == 18
+    assert state.status()["armed"] is False
+    assert state.status()["kill_switch"] is True
+
+
+def test_request_id_cannot_be_reused_for_different_order(tmp_path):
+    live, state = service(tmp_path)
+    broker = FakeLiveBroker()
+    state.arm(60)
+    live.submit_market(broker, "request_0003", "BTC/USD", Side.BUY, 1)
+
+    with pytest.raises(RiskRejected, match="different live order"):
+        live.submit_market(broker, "request_0003", "BTC/USD", Side.BUY, 1.1)
+
+
+def test_daily_limit_is_atomic_with_arm_consumption(tmp_path):
+    live, state = service(tmp_path)
+    broker = FakeLiveBroker()
+    state.arm(60)
+    live.submit_market(broker, "request_0004", "BTC/USD", Side.BUY, 1)
+    state.arm(60)
+
+    with pytest.raises(RiskRejected, match="daily live notional"):
+        live.submit_market(broker, "request_0005", "BTC/USD", Side.BUY, 1.1)
+
+    assert len(broker.orders) == 1
+    assert state.status()["armed"] is True
+
+
+def test_unknown_exchange_outcome_is_not_retried(tmp_path):
+    live, state = service(tmp_path)
+    broker = FakeLiveBroker(fail_submit=True)
+    state.arm(60)
+
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        live.submit_market(broker, "request_0006", "BTC/USD", Side.BUY, 1)
+
+    record = state.require("request_0006")
+    assert record.status == "unknown"
+    assert state.status()["armed"] is False
+    assert len(broker.orders) == 1
+
+    retry = live.submit_market(broker, "request_0006", "BTC/USD", Side.BUY, 1)
+    assert retry.status == "unknown"
+    assert len(broker.orders) == 1
+
+
+def test_live_risk_rejects_stale_quote_insufficient_balance_and_short(tmp_path):
+    stale, stale_state = service(tmp_path / "stale")
+    stale_state.arm(60)
+    old = int(time.time() * 1000) - 60_000
+    with pytest.raises(RiskRejected, match="stale"):
+        stale.submit_market(
+            FakeLiveBroker(timestamp=old), "request_0007", "BTC/USD", Side.BUY, 1
+        )
+
+    cash, cash_state = service(tmp_path / "cash")
+    cash_state.arm(60)
+    with pytest.raises(RiskRejected, match="insufficient"):
+        cash.submit_market(
+            FakeLiveBroker(quote_balance=10), "request_0008", "BTC/USD", Side.BUY, 1
+        )
+
+    sell, sell_state = service(tmp_path / "sell")
+    sell_state.arm(60)
+    with pytest.raises(RiskRejected, match="short positions"):
+        sell.submit_market(
+            FakeLiveBroker(position=0), "request_0009", "BTC/USD", Side.SELL, 1
+        )
+
+
+def test_live_read_routes_require_auth_when_auth_enabled():
+    app = FastAPI()
+    install_security_middleware(
+        app,
+        SecurityConfig(
+            require_auth=True,
+            api_key="x" * 32,
+            max_body_bytes=1024,
+            mutation_rate_per_minute=10,
+        ),
+    )
+
+    @app.get("/live/status")
+    def live_status():
+        return {"ok": True}
+
+    @app.get("/public")
+    def public():
+        return {"ok": True}
+
+    client = TestClient(app)
+    assert client.get("/public").status_code == 200
+    assert client.get("/live/status").status_code == 401
+    assert (
+        client.get("/live/status", headers={"Authorization": f"Bearer {'x' * 32}"}).status_code
+        == 200
+    )
+
+
+def test_api_restart_and_backup_restore_fail_closed(tmp_path):
+    from trading_platform.backup import create_backup, restore_backup
+
+    data = tmp_path / "data"
+    state = LiveStateStore(data / "live.sqlite3")
+    state.arm(60)
+    assert state.status()["armed"] is True
+
+    restarted = LiveStateStore(data / "live.sqlite3", disarm_on_start=True)
+    assert restarted.status()["armed"] is False
+
+    restarted.arm(60)
+    archive = create_backup(data, tmp_path / "backup.tar.gz")
+    restore_backup(archive, tmp_path / "restored")
+    restored = LiveStateStore(tmp_path / "restored" / "live.sqlite3")
+    assert restored.status()["armed"] is False
+    assert restored.status()["kill_switch"] is True
+
+
+def test_reconciliation_resolves_unknown_by_client_order_id(tmp_path):
+    live, state = service(tmp_path)
+    broker = FakeLiveBroker(fail_submit=True)
+    state.arm(60)
+    with pytest.raises(RuntimeError):
+        live.submit_market(broker, "request_0010", "BTC/USD", Side.BUY, 1)
+
+    record = state.require("request_0010")
+    broker.remote_open = [
+        {
+            "id": "exchange-recovered",
+            "clientOrderId": record.client_order_id,
+            "status": "closed",
+        }
+    ]
+    result = live.reconcile_orders(broker)
+
+    assert result["updated"] == 1
+    assert result["unresolved_unknown"] == 0
+    assert state.require("request_0010").status == "closed"
+
+
+def test_emergency_stop_disarms_and_cancels_only_platform_owned_orders(tmp_path):
+    live, state = service(tmp_path)
+    broker = FakeLiveBroker()
+    state.arm(60)
+    owned = live.submit_market(broker, "request_0012", "BTC/USD", Side.BUY, 1)
+    state.arm(60)
+    broker.remote_open = [
+        {
+            "id": "open-owned",
+            "clientOrderId": owned.client_order_id,
+            "symbol": "BTC/USD",
+            "status": "open",
+        },
+        {
+            "id": "open-unrelated",
+            "clientOrderId": "someone-else",
+            "symbol": "BTC/USD",
+            "status": "open",
+        },
+    ]
+
+    result = live.emergency_stop(broker)
+
+    assert result["kill_switch"] is True
+    assert result["armed"] is False
+    assert result["cancelled"] == 1
+    assert [item["id"] for item in broker.remote_open] == ["open-unrelated"]
+    assert state.status()["armed"] is False
+
+
+def test_restart_marks_inflight_live_order_unknown(tmp_path):
+    state = LiveStateStore(tmp_path / "live.sqlite3")
+    state.arm(60)
+    record, created = state.reserve(
+        "request_0011",
+        "kraken",
+        "BTC/USD",
+        Side.BUY,
+        1,
+        50,
+        requested_quantity=1,
+        max_daily_notional=100,
+    )
+    assert created is True
+    assert record.status == "reserved"
+
+    restarted = LiveStateStore(tmp_path / "live.sqlite3", disarm_on_start=True)
+
+    recovered = restarted.require("request_0011")
+    assert recovered.status == "unknown"
+    assert "reconciliation required" in recovered.error
+    assert restarted.status()["armed"] is False
+
+
+def test_live_config_refuses_non_one_shot_when_enabled(monkeypatch):
+    monkeypatch.setenv("TRADING_LIVE_ENABLED", "1")
+    monkeypatch.setenv("TRADING_LIVE_ONE_SHOT_ARM", "0")
+
+    with pytest.raises(RuntimeError, match="one-shot"):
+        LiveTradingConfig.from_env()
