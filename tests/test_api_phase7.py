@@ -10,7 +10,7 @@ def test_phase7_health_and_readiness():
     ready = client.get("/ready")
 
     assert health.status_code == 200
-    assert health.json()["version"] == "0.7.0"
+    assert health.json()["version"] == "0.8.0"
     assert health.json()["live_trading"] is False
     assert ready.status_code == 200
     assert ready.json()["ready"] is True
@@ -30,7 +30,7 @@ def test_prometheus_metrics_include_job_queue_and_paper_mode():
     response = client.get("/metrics/prometheus")
 
     assert response.status_code == 200
-    assert 'trading_platform_info{mode="paper",live_trading="false"} 1' in response.text
+    assert 'trading_platform_info{mode="paper",live_capability_enabled="false"} 1' in response.text
     assert 'trading_platform_jobs{status="queued"}' in response.text
 
 

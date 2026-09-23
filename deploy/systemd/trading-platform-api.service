@@ -1,5 +1,5 @@
 [Unit]
-Description=Trading Platform API (paper/research only)
+Description=Trading Platform API (live execution fail-closed by default)
 After=network-online.target
 Wants=network-online.target
 
@@ -10,6 +10,7 @@ Group=botadmin
 WorkingDirectory=/opt/trading-platform/current
 EnvironmentFile=/etc/trading-platform.env
 ExecStart=/usr/bin/env /opt/trading-platform/venv/bin/uvicorn trading_platform.api:app --host 127.0.0.1 --port 48070 --workers 1
+ExecStopPost=/usr/bin/env /opt/trading-platform/venv/bin/python scripts/live-control.py disarm
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=30

@@ -1,8 +1,8 @@
 # Trading Platform
 
-Modular, paper-first algorithmic trading and research platform. **Live trading remains disabled.**
+Modular, paper-first algorithmic trading and research platform. Phase 8 contains a fail-closed live execution boundary, but **live capability remains disabled by default and no real order is enabled by this repository alone.**
 
-## Phase 7 status
+## Phase 8 status
 
 - CCXT public realtime ticker + OHLCV
 - SHA-256 content-addressed historical datasets
@@ -24,6 +24,11 @@ Modular, paper-first algorithmic trading and research platform. **Live trading r
 - Readiness and Prometheus-compatible operational metrics
 - Verified backup/restore tooling with per-file SHA-256 manifest
 - Hardened systemd candidate units and Docker API candidate
+- Fail-closed CCXT private live execution boundary (disabled by default)
+- Host-local, TTL-limited one-shot arming; there is no HTTP arm endpoint
+- Live symbol allowlist, per-order/position/daily notional limits, balance/precision/freshness checks
+- Durable live order ledger with client-order idempotency and unknown-outcome quarantine
+- Startup fail-closed recovery, reconciliation, kill switch, and emergency open-order cancellation
 - FastAPI, Docker/Compose, GitHub Actions CI
 
 ## Architecture
@@ -48,7 +53,7 @@ Native  VectorBT  Nautilus subprocess
 Dataset -> LEAN export bundle -> LEAN CLI/Docker (optional external runner)
 ```
 
-The execution-capable platform path remains **paper only**. Research and simulation engines cannot submit live exchange orders.
+Research and simulation engines still cannot submit live exchange orders. The separate Phase 8 live boundary can only submit when live capability is explicitly enabled in host configuration **and** a short-lived host-local one-shot arm is active. Defaults remain disabled and disarmed.
 
 ## Run control plane
 
@@ -189,6 +194,57 @@ curl -X POST http://127.0.0.1:8000/datasets/ccxt \
 
 Identical canonical content produces the same SHA-256 dataset ID. Dataset loads verify the hash before use.
 
+
+## Phase 8 live execution boundary
+
+Live execution is deliberately separated from paper/research. The default configuration is:
+
+```text
+TRADING_LIVE_ENABLED=0
+kill_switch=true
+armed=false
+one_shot_arm=true
+```
+
+There is intentionally **no HTTP endpoint to arm live trading**. Arming can only be performed from the host after the environment has been deliberately configured:
+
+```bash
+python scripts/live-preflight.py --private-read-check
+python scripts/live-control.py status
+python scripts/live-control.py arm --ttl 60 --confirm ENABLE_REAL_MONEY_ORDER_WINDOW
+```
+
+The private preflight performs read-only credential/exchange checks and never creates an order. A live order still requires authenticated HTTP, an allowlisted symbol, exchange precision/minimum validation, a fresh quote, deterministic risk limits, available balance, a daily notional budget, and a unique request id. The arm is consumed atomically before the exchange call, so one arm authorizes at most one new live order.
+
+```bash
+curl -X POST http://127.0.0.1:48070/live/orders \
+  -H 'Authorization: Bearer <TRADING_API_KEY>' \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"manual_canary_001","symbol":"BTC/USD","side":"buy","quantity":0.0001}'
+```
+
+Do not run that request until a real-money canary is separately approved. Reusing the same request id cannot create a second order. If an exchange call times out after reservation, the ledger records `unknown` and refuses to retry that request id until reconciliation.
+
+Operational controls:
+
+```bash
+# Always available locally; immediately blocks new live orders.
+python scripts/live-control.py disarm
+
+# Authenticated API kill switch; when live capability is configured it also attempts
+# to cancel this platform's tracked open orders on allowlisted symbols.
+curl -X POST http://127.0.0.1:48070/live/emergency-stop \
+  -H 'Authorization: Bearer <TRADING_API_KEY>'
+
+# Reconcile local unknown/open records against recent exchange orders.
+curl -X POST http://127.0.0.1:48070/live/reconcile \
+  -H 'Authorization: Bearer <TRADING_API_KEY>'
+```
+
+API process startup and systemd shutdown both disarm live execution. In-flight `reserved`/`submitted` records become `unknown` after process restart and require reconciliation. Backup snapshots also force the restored live control state to disarmed.
+
+The exchange API key should be scoped to only the query/trading permissions required for this service and should not have withdrawal permissions. Real credentials belong only in the host's protected environment file, never in Git.
+
 ## Paper trading
 
 ```bash
@@ -206,6 +262,7 @@ Mutable runtime state is now separated from immutable research artifacts:
 ```text
 /data/runtime.sqlite3        # paper cash + positions, WAL/FULL sync
 /data/jobs.sqlite3           # durable queue, leases/retry/recovery
+/data/live.sqlite3           # fail-closed live control + idempotent order ledger
 /data/paper-audit.jsonl
 /data/historical/...         # immutable content-addressed datasets
 /data/simulations/...
@@ -233,7 +290,7 @@ curl http://127.0.0.1:8000/security/status
 curl http://127.0.0.1:8000/metrics/prometheus
 ```
 
-`/ready` verifies SQLite integrity and writable durable storage. No secret value is returned by the status endpoint.
+`/ready` verifies paper/runtime and live-ledger SQLite integrity plus writable durable storage. No secret value is returned by the status endpoint. Authenticated live status is available at `/live/status` when API auth is enabled.
 
 ## Backup and recovery
 
@@ -250,7 +307,7 @@ Restore drills must target an empty staging directory first:
 python scripts/backup-data.py restore /secure-backups/trading-platform.tar.gz /tmp/trading-restore-drill
 ```
 
-SQLite databases are copied through SQLite's backup API. Every other persisted file is covered by a SHA-256 manifest inside the archive.
+SQLite databases are copied through SQLite's backup API. Live-control snapshots are forced to the disarmed state before archiving. Every other persisted file is covered by a SHA-256 manifest inside the archive.
 
 ## Production candidate deployment
 
@@ -258,25 +315,28 @@ SQLite databases are copied through SQLite's backup API. Every other persisted f
 
 Docker Compose remains an API-only candidate and now uses loopback binding, read-only root filesystem, dropped capabilities, no-new-privileges, tmpfs, and `/ready` health checks.
 
-Run `scripts/production-preflight.sh` before any candidate promotion. Phase 7 does **not** perform a production cutover or enable live trading.
+Run `scripts/production-preflight.sh` before any candidate promotion. Phase 8 code does **not** perform a production cutover, install credentials, arm the system, or place a real order.
 
 ## Safety gates
 
-- live exchange-order code does not exist
-- paper execution is the only execution path
-- Nautilus runs in an isolated simulation subprocess
-- Nautilus jobs always return `live_mode=false`
-- VectorBT has no execution adapter
-- LEAN output is backtest-only and generated with `live-mode=false`
-- no `lean live` invocation exists
-- all paper orders pass `RiskManager`
-- short selling is disabled by default in paper execution
-- datasets, plans, exports, and experiments carry deterministic provenance
-- dashboard is read-only
+- live capability defaults to disabled and the durable kill switch defaults to engaged
+- there is no HTTP arm endpoint; arming is host-local, confirmation-gated, TTL-limited, and one-shot
+- API startup and systemd shutdown disarm live execution
+- live GET/order/control endpoints require Bearer auth when production auth is enabled
+- live symbols are allowlisted and shorts are disabled
+- exchange amount precision/minimums, quote freshness, available balances, per-order, position, and daily notional limits are checked before reservation
+- live request ids are durable/idempotent and map to a bounded exchange client-order id
+- an arm is consumed in the same SQLite transaction that reserves the order
+- ambiguous exchange outcomes become `unknown`; automatic retry is forbidden
+- restart recovery converts in-flight reservations to `unknown` for reconciliation
+- emergency stop disarms first, then attempts cancellation only of this platform's tracked open orders on allowlisted symbols
+- backup/restore cannot restore an armed state
+- AI, FinRL, Nautilus, VectorBT, LEAN, and durable research jobs have no path to the live-order endpoint
+- Docker Compose remains hard-pinned to `TRADING_LIVE_ENABLED=0`
 
 ## Validation
 
-Phase 7 validation includes:
+Phase 8 validation includes:
 
 - unit/API suite
 - actual NautilusTrader 2.x worker execution
@@ -294,9 +354,16 @@ Phase 7 validation includes:
 - backup -> verify -> restore recovery drill
 - authenticated HTTP mutation gate test
 - 200-request concurrent readiness/metrics stress smoke
+- fail-closed live-state and restart tests
+- one-shot arm and idempotent-order tests
+- stale quote, balance, short, and daily-limit rejection tests
+- ambiguous-outcome quarantine and reconciliation tests
+- emergency-stop cancellation test
+- live backup/restore disarm test
+- live HTTP arm endpoint absence test
 
 Backtest and simulation results are research outputs, not profit guarantees.
 
 ## Next phase
 
-Phase 7 completes the paper/research production-hardening roadmap. A future Phase 8 may add live trading only as a separately reviewed execution system with explicit credentials, tighter risk limits, kill switches, reconciliation, canary acceptance, and an explicit production cutover decision. Nothing in Phase 7 enables live orders.
+Phase 8A implements and tests the live execution safety boundary while keeping it disabled. Phase 8B is a separately approved real-exchange canary: provision a least-privilege exchange key, run the private read-only preflight, inspect balances/open orders, select a deliberately tiny canary order within the configured caps, arm once, submit once, reconcile, and immediately disarm. That canary and any production cutover are **not performed automatically** by this phase.

@@ -1,6 +1,6 @@
 [project]
 name = "trading-platform"
-version = "0.7.0"
+version = "0.8.0"
 description = "Modular algorithmic trading platform with paper-first execution"
 requires-python = ">=3.11"
 dependencies = [

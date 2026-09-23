@@ -5,14 +5,16 @@ from trading_platform.api import app
 client = TestClient(app)
 
 
-def test_health_reports_paper_only_v07():
+def test_health_reports_paper_default_v08():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
         "mode": "paper",
         "live_trading": False,
-        "version": "0.7.0",
+        "live_capability_enabled": False,
+        "live_armed": False,
+        "version": "0.8.0",
     }
 
 

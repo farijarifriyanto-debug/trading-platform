@@ -67,11 +67,12 @@ def install_security_middleware(app, config: SecurityConfig) -> MutationRateLimi
             client = request.client.host if request.client else "unknown"
             if not limiter.allow(client):
                 return JSONResponse(status_code=429, content={"detail": "mutation rate limit exceeded"})
-            if config.require_auth:
-                authorization = request.headers.get("authorization", "")
-                expected = f"Bearer {config.api_key}"
-                if not secrets.compare_digest(authorization, expected):
-                    return JSONResponse(status_code=401, content={"detail": "authentication required"})
+        requires_auth = request.method in unsafe or request.url.path.startswith("/live/")
+        if config.require_auth and requires_auth:
+            authorization = request.headers.get("authorization", "")
+            expected = f"Bearer {config.api_key}"
+            if not secrets.compare_digest(authorization, expected):
+                return JSONResponse(status_code=401, content={"detail": "authentication required"})
 
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"

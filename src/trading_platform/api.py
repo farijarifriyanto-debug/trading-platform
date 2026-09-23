@@ -22,6 +22,7 @@ from .execution import PaperBroker
 from .experiments import ExperimentSpec, ExperimentStore
 from .finrlx import FinRLXResearchService
 from .lean_export import LeanExporter
+from .live import CCXTLiveBroker, LiveExecutionService, LiveStateStore, LiveTradingConfig
 from .jobs import DurableJobQueue
 from .market import CCXTMarketData
 from .metrics import collect_metrics
@@ -35,13 +36,22 @@ from .state import RuntimeState
 from .sweep import run_sma_parameter_sweep
 from .workers import SimulationWorkerService, WorkerFailed, WorkerUnavailable
 
-app = FastAPI(title="Trading Platform", version="0.7.0")
+app = FastAPI(title="Trading Platform", version="0.8.0")
 security_config = SecurityConfig.from_env()
+live_config = LiveTradingConfig.from_env()
+if live_config.enabled:
+    if not security_config.require_auth:
+        raise RuntimeError("live execution requires TRADING_REQUIRE_AUTH=1")
+    if len(os.getenv("TRADING_API_KEY", "")) < 32:
+        raise RuntimeError("live execution requires a TRADING_API_KEY of at least 32 characters")
+    if not os.getenv("TRADING_LIVE_EXCHANGE_API_KEY") or not os.getenv("TRADING_LIVE_EXCHANGE_SECRET"):
+        raise RuntimeError("live execution requires exchange credentials")
 install_security_middleware(app, security_config)
 
 data_root = Path(os.getenv("TRADING_DATA_DIR", "data"))
 runtime_state = RuntimeState(data_root / "runtime.sqlite3")
 job_queue = DurableJobQueue(data_root / "jobs.sqlite3")
+live_state = LiveStateStore(data_root / "live.sqlite3", disarm_on_start=True)
 paper = PaperBroker(portfolio=runtime_state.load_portfolio(), state=runtime_state)
 audit = JSONLAuditLog(os.getenv("TRADING_AUDIT_PATH", str(data_root / "paper-audit.jsonl")))
 strategies = default_strategy_registry()
@@ -56,6 +66,7 @@ lean_exporter = LeanExporter(data_root / "lean-exports")
 ai_candidate_store = AICandidateStore(data_root / "ai-candidates")
 ai_worker = AIResearchWorkerService(ai_candidate_store, data_root / "models")
 finrlx_service = FinRLXResearchService()
+live_service = LiveExecutionService(live_config, live_state, audit)
 
 
 class PaperOrder(BaseModel):
@@ -67,6 +78,17 @@ class PaperOrder(BaseModel):
 
 class MarketPaperOrder(BaseModel):
     exchange: str = "kraken"
+    symbol: str = "BTC/USD"
+    side: Side
+    quantity: float = Field(gt=0)
+
+
+class LiveMarketOrderRequest(BaseModel):
+    request_id: str = Field(
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
     symbol: str = "BTC/USD"
     side: Side
     quantity: float = Field(gt=0)
@@ -167,6 +189,15 @@ def _market(exchange: str) -> CCXTMarketData:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _live_broker() -> CCXTLiveBroker:
+    if not live_config.enabled:
+        raise HTTPException(status_code=409, detail="live execution capability is disabled")
+    try:
+        return CCXTLiveBroker(live_config.exchange_id)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 def _load_dataset(dataset_id: str):
     try:
         return dataset_store.load(dataset_id)
@@ -185,11 +216,14 @@ async def risk_rejected_handler(_, exc: RiskRejected):
 
 @app.get("/health")
 def health():
+    live = live_service.status()
     return {
         "status": "ok",
         "mode": "paper",
-        "live_trading": False,
-        "version": "0.7.0",
+        "live_trading": bool(live["capability_enabled"] and live["armed"]),
+        "live_capability_enabled": live["capability_enabled"],
+        "live_armed": live["armed"],
+        "version": "0.8.0",
     }
 
 
@@ -198,6 +232,8 @@ def health():
 @app.get("/ready")
 def readiness():
     state = runtime_state.health()
+    live_db = live_state.health()
+    live_control = live_state.status()
     data_root.mkdir(parents=True, exist_ok=True)
     writable = False
     try:
@@ -209,12 +245,15 @@ def readiness():
         writable = True
     except OSError:
         writable = False
-    ready = bool(state.get("ok")) and writable
+    ready = bool(state.get("ok")) and bool(live_db.get("ok")) and writable
     payload = {
         "ready": ready,
         "mode": "paper",
-        "live_trading": False,
+        "live_trading": bool(live_config.enabled and live_control["armed"]),
+        "live_capability_enabled": live_config.enabled,
+        "live_armed": live_control["armed"],
         "runtime_state": state,
+        "live_state": live_db,
         "data_root_writable": writable,
         "jobs": job_queue.counts(),
     }
@@ -229,8 +268,85 @@ def security_status():
         "auth_required_for_mutations": security_config.require_auth,
         "max_body_bytes": security_config.max_body_bytes,
         "mutation_rate_per_minute": security_config.mutation_rate_per_minute,
-        "live_trading": False,
+        "live_trading": bool(live_config.enabled and live_state.status()["armed"]),
+        "live_capability_enabled": live_config.enabled,
     }
+
+
+
+
+@app.get("/live/status")
+def live_status():
+    return live_service.status()
+
+
+@app.get("/live/orders")
+def live_orders(limit: int = Query(default=100, ge=1, le=1000)):
+    return [asdict(record) for record in live_state.list(limit=limit)]
+
+
+@app.get("/live/orders/{request_id}")
+def live_order(request_id: str):
+    try:
+        return asdict(live_state.require(request_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="live order not found") from exc
+
+
+@app.post("/live/disarm")
+def live_disarm():
+    status = live_state.disarm()
+    audit.record("live_disarmed", {"source": "api"})
+    return status
+
+
+@app.post("/live/orders")
+def live_market_order(req: LiveMarketOrderRequest):
+    try:
+        record = live_service.submit_market(
+            _live_broker(),
+            req.request_id,
+            req.symbol,
+            req.side,
+            req.quantity,
+        )
+        return asdict(record)
+    except RiskRejected:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/live/reconcile")
+def live_reconcile():
+    try:
+        return live_service.reconcile_orders(_live_broker())
+    except RiskRejected:
+        raise
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=502, detail=f"live reconciliation failed: {exc}") from exc
+
+
+@app.post("/live/emergency-stop")
+def live_emergency_stop():
+    live_state.disarm()
+    if not live_config.enabled:
+        audit.record(
+            "live_emergency_stop",
+            {"exchange": live_config.exchange_id, "cancelled": 0, "errors": [], "kill_switch": True},
+        )
+        return {"kill_switch": True, "armed": False, "cancelled": 0, "errors": []}
+    try:
+        return live_service.emergency_stop(_live_broker())
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=502,
+            detail=f"kill switch engaged but remote cancellation failed: {exc}",
+        ) from exc
 
 
 @app.get("/jobs")
@@ -314,9 +430,13 @@ def prometheus_metrics():
         )
     )
     jobs = job_queue.counts()
+    live = live_service.status()
     lines = [
         "# TYPE trading_platform_info gauge",
-        'trading_platform_info{mode="paper",live_trading="false"} 1',
+        f'trading_platform_info{{mode="paper",live_capability_enabled="{str(live["capability_enabled"]).lower()}"}} 1',
+        f'trading_platform_live_armed {1 if live["armed"] else 0}',
+        f'trading_platform_live_kill_switch {1 if live["kill_switch"] else 0}',
+        f'trading_platform_live_daily_reserved_notional {live["daily_reserved_notional"]}',
     ]
     for key, value in platform.items():
         if isinstance(value, (int, float)):
