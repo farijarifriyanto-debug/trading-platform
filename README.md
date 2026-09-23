@@ -2,7 +2,7 @@
 
 Modular, paper-first algorithmic trading and research platform. **Live trading remains disabled.**
 
-## Phase 5 status
+## Phase 6 status
 
 - CCXT public realtime ticker + OHLCV
 - SHA-256 content-addressed historical datasets
@@ -13,6 +13,11 @@ Modular, paper-first algorithmic trading and research platform. **Live trading r
 - QuantConnect LEAN deterministic export pipeline
 - Experiment registry and cross-engine comparison
 - Responsive read-only operations dashboard
+- AI candidate registry with deterministic SHA-256 provenance
+- Isolated scikit-learn walk-forward research worker
+- Explicit robustness gate: `RESEARCH_PASS` / `REVIEW_REQUIRED`
+- FinRL-X isolated out-of-sample backtest integration
+- Model artifact SHA-256 provenance
 - FastAPI, Docker/Compose, GitHub Actions CI
 
 ## Architecture
@@ -151,6 +156,23 @@ manifest.json
 
 The generated configuration sets `live-mode=false`. LEAN CLI local backtests use the official Docker engine and require a configured LEAN workspace. The platform never invokes `lean live`.
 
+## AI / FinRL research
+
+AI research is isolated from execution. Candidate specs bind the immutable dataset ID, feature version, model family, seed, folds, hyperparameters, and robustness policy into a deterministic candidate ID.
+
+Worker health:
+
+```bash
+curl http://127.0.0.1:8000/ai/health
+curl http://127.0.0.1:8000/ai/finrlx/health
+```
+
+The reference ML worker uses chronological walk-forward folds with a seeded random forest. It records fold metrics, out-of-sample predictions, scikit-learn version, hyperparameters, and a SHA-256 of the persisted model artifact. The robustness gate is research-only and never authorizes orders.
+
+A completed candidate can be evaluated by the isolated FinRL-X backtest worker. FinRL-X receives only the immutable dataset and out-of-sample predictions and always returns `execution_enabled=false` and `live_mode=false`.
+
+Phase 6 live validation uses a synthetic immutable dataset and verifies both the real scikit-learn worker and FinRL-X worker end-to-end.
+
 ## Historical datasets
 
 ```bash
@@ -200,7 +222,7 @@ Docker Compose persists `/data`:
 
 ## Validation
 
-Phase 5 validation includes:
+Phase 6 validation includes:
 
 - unit/API suite
 - actual NautilusTrader 2.x worker execution
@@ -208,9 +230,13 @@ Phase 5 validation includes:
 - native/VectorBT/Nautilus comparison on the same dataset
 - LEAN CLI installation/health
 - deterministic LEAN bundle generation
+- real isolated scikit-learn walk-forward model training
+- model artifact hashing and candidate provenance
+- real FinRL-X out-of-sample backtest worker execution
+- AI/FinRL safety assertions (`live_mode=false`, `execution_enabled=false`)
 
 Backtest and simulation results are research outputs, not profit guarantees.
 
 ## Next phase
 
-Phase 6 focuses on AI/FinRL research: model/dataset provenance, walk-forward evaluation, robustness gates, candidate generation, and reproducible AI-assisted experiments. AI remains separated from order execution.
+Phase 7 focuses on production hardening: durable database-backed state, scheduler/worker supervision, monitoring and recovery, security review, deployment, and stress/integration acceptance. Live trading remains a separate later phase.

@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .ai_research import AICandidateSpec, AICandidateStore, AIResearchWorkerService, RobustnessPolicy
 from .audit import JSONLAuditLog
 from .backtest import run_sma_backtest
 from .datasets import (
@@ -18,6 +19,7 @@ from .dashboard import dashboard_response
 from .domain import OrderIntent, Side
 from .execution import PaperBroker
 from .experiments import ExperimentSpec, ExperimentStore
+from .finrlx import FinRLXResearchService
 from .lean_export import LeanExporter
 from .market import CCXTMarketData
 from .metrics import collect_metrics
@@ -29,7 +31,7 @@ from .simulation import SimulationPlanStore, SimulationSpec, default_simulation_
 from .sweep import run_sma_parameter_sweep
 from .workers import SimulationWorkerService, WorkerFailed, WorkerUnavailable
 
-app = FastAPI(title="Trading Platform", version="0.5.0")
+app = FastAPI(title="Trading Platform", version="0.6.0")
 
 data_root = Path(os.getenv("TRADING_DATA_DIR", "data"))
 paper = PaperBroker()
@@ -43,6 +45,9 @@ simulation_plans = SimulationPlanStore(data_root / "simulations")
 experiment_store = ExperimentStore(data_root / "experiments")
 worker_service = SimulationWorkerService(experiment_store)
 lean_exporter = LeanExporter(data_root / "lean-exports")
+ai_candidate_store = AICandidateStore(data_root / "ai-candidates")
+ai_worker = AIResearchWorkerService(ai_candidate_store, data_root / "models")
+finrlx_service = FinRLXResearchService()
 
 
 class PaperOrder(BaseModel):
@@ -129,6 +134,24 @@ class LeanExportRequest(BaseModel):
     initial_cash: float = Field(default=100_000.0, gt=0)
 
 
+class RobustnessRequest(BaseModel):
+    min_samples: int = Field(default=100, ge=30)
+    min_folds: int = Field(default=3, ge=2)
+    min_mean_accuracy: float = Field(default=0.52, ge=0, le=1)
+    min_accuracy_uplift: float = Field(default=0.0, ge=-1, le=1)
+    max_accuracy_std: float = Field(default=0.15, ge=0, le=1)
+
+
+class AICandidateRequest(BaseModel):
+    dataset_id: str
+    model_family: str = "random_forest_direction"
+    seed: int = 42
+    folds: int = Field(default=3, ge=2, le=20)
+    initial_train_fraction: float = Field(default=0.5, gt=0.1, lt=0.9)
+    hyperparameters: dict[str, Any] = Field(default_factory=dict)
+    robustness: RobustnessRequest = Field(default_factory=RobustnessRequest)
+
+
 def _market(exchange: str) -> CCXTMarketData:
     try:
         return CCXTMarketData(exchange)
@@ -158,7 +181,7 @@ def health():
         "status": "ok",
         "mode": "paper",
         "live_trading": False,
-        "version": "0.5.0",
+        "version": "0.6.0",
     }
 
 
@@ -174,7 +197,7 @@ def dashboard():
 
 @app.get("/metrics")
 def platform_metrics():
-    return asdict(collect_metrics(dataset_store, paper.portfolio, audit, experiment_store))
+    return asdict(collect_metrics(dataset_store, paper.portfolio, audit, experiment_store, ai_candidate_store))
 
 
 @app.get("/simulations/engines")
@@ -185,6 +208,86 @@ def simulation_engines():
 @app.get("/workers/health")
 def workers_health():
     return worker_service.health()
+
+
+@app.get("/ai/health")
+def ai_research_health():
+    return ai_worker.health()
+
+
+@app.get("/ai/finrlx/health")
+def finrlx_health():
+    return finrlx_service.health()
+
+
+@app.post("/ai/candidates/{candidate_id}/finrlx")
+def run_finrlx_candidate(candidate_id: str):
+    try:
+        record = ai_candidate_store.require(candidate_id)
+        dataset = _load_dataset(record.spec.dataset_id)
+        finrlx_result = finrlx_service.run(record, dataset)
+        merged = dict(record.result or {})
+        merged["finrlx_backtest"] = finrlx_result
+        updated = ai_candidate_store.update(
+            record.candidate_id,
+            record.status,
+            gate_status=record.gate_status,
+            gate_reasons=record.gate_reasons,
+            result=merged,
+            error=record.error,
+        )
+        return asdict(updated)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI candidate not found") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+
+@app.get("/ai/candidates")
+def list_ai_candidates():
+    return [asdict(record) for record in ai_candidate_store.records()]
+
+
+@app.post("/ai/candidates")
+def create_ai_candidate(req: AICandidateRequest):
+    _load_dataset(req.dataset_id)
+    policy = RobustnessPolicy(**req.robustness.model_dump())
+    record = ai_candidate_store.create(
+        AICandidateSpec(
+            dataset_id=req.dataset_id,
+            model_family=req.model_family,
+            seed=req.seed,
+            folds=req.folds,
+            initial_train_fraction=req.initial_train_fraction,
+            hyperparameters=req.hyperparameters,
+            robustness=policy,
+        )
+    )
+    return asdict(record)
+
+
+@app.get("/ai/candidates/{candidate_id}")
+def get_ai_candidate(candidate_id: str):
+    try:
+        return asdict(ai_candidate_store.require(candidate_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI candidate not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/ai/candidates/{candidate_id}/run")
+def run_ai_candidate(candidate_id: str):
+    try:
+        record = ai_candidate_store.require(candidate_id)
+        dataset = _load_dataset(record.spec.dataset_id)
+        return asdict(ai_worker.run(record, dataset))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="AI candidate not found") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
 
 
 @app.get("/experiments")
