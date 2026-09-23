@@ -13,9 +13,15 @@ class BacktestResult:
     trades: int
 
 
-def run_sma_backtest(prices: list[float], symbol: str = "TEST/USD",
-                     quantity: float = 1.0, fast: int = 5, slow: int = 20) -> BacktestResult:
-    portfolio = Portfolio()
+def run_sma_backtest(
+    prices: list[float],
+    symbol: str = "TEST/USD",
+    quantity: float = 1.0,
+    fast: int = 5,
+    slow: int = 20,
+    initial_cash: float = 100_000.0,
+) -> BacktestResult:
+    portfolio = Portfolio(cash=initial_cash)
     broker = PaperBroker(portfolio=portfolio)
     start_cash = portfolio.cash
     trades = 0

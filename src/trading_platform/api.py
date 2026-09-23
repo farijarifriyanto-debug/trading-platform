@@ -17,6 +17,8 @@ from .datasets import (
 from .dashboard import dashboard_response
 from .domain import OrderIntent, Side
 from .execution import PaperBroker
+from .experiments import ExperimentSpec, ExperimentStore
+from .lean_export import LeanExporter
 from .market import CCXTMarketData
 from .metrics import collect_metrics
 from .paper import PaperTradingService
@@ -25,8 +27,9 @@ from .research import VectorBTResearch, VectorBTUnavailable
 from .risk import RiskRejected
 from .simulation import SimulationPlanStore, SimulationSpec, default_simulation_registry
 from .sweep import run_sma_parameter_sweep
+from .workers import SimulationWorkerService, WorkerFailed, WorkerUnavailable
 
-app = FastAPI(title="Trading Platform", version="0.4.0")
+app = FastAPI(title="Trading Platform", version="0.5.0")
 
 data_root = Path(os.getenv("TRADING_DATA_DIR", "data"))
 paper = PaperBroker()
@@ -37,6 +40,9 @@ dataset_store = HistoricalDatasetStore(data_root / "historical")
 historical_data = HistoricalDataService(dataset_store)
 simulations = default_simulation_registry()
 simulation_plans = SimulationPlanStore(data_root / "simulations")
+experiment_store = ExperimentStore(data_root / "experiments")
+worker_service = SimulationWorkerService(experiment_store)
+lean_exporter = LeanExporter(data_root / "lean-exports")
 
 
 class PaperOrder(BaseModel):
@@ -108,6 +114,21 @@ class SimulationPlanRequest(BaseModel):
     base_currency: str = Field(default="USD", min_length=3, max_length=12)
 
 
+class ExperimentRequest(BaseModel):
+    dataset_id: str
+    engine: str = "native"
+    strategy: str = "sma_trend"
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"fast": 5, "slow": 20})
+    initial_cash: float = Field(default=100_000.0, gt=0)
+    quantity: float | None = Field(default=None, gt=0)
+
+
+class LeanExportRequest(BaseModel):
+    dataset_id: str
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"fast": 5, "slow": 20})
+    initial_cash: float = Field(default=100_000.0, gt=0)
+
+
 def _market(exchange: str) -> CCXTMarketData:
     try:
         return CCXTMarketData(exchange)
@@ -137,7 +158,7 @@ def health():
         "status": "ok",
         "mode": "paper",
         "live_trading": False,
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
 
 
@@ -153,12 +174,84 @@ def dashboard():
 
 @app.get("/metrics")
 def platform_metrics():
-    return asdict(collect_metrics(dataset_store, paper.portfolio, audit))
+    return asdict(collect_metrics(dataset_store, paper.portfolio, audit, experiment_store))
 
 
 @app.get("/simulations/engines")
 def simulation_engines():
     return simulations.catalog()
+
+
+@app.get("/workers/health")
+def workers_health():
+    return worker_service.health()
+
+
+@app.get("/experiments")
+def list_experiments():
+    return [asdict(record) for record in experiment_store.records()]
+
+
+@app.get("/experiments/compare")
+def compare_experiments(dataset_id: str | None = None):
+    return experiment_store.compare(dataset_id)
+
+
+@app.post("/experiments")
+def create_experiment(req: ExperimentRequest):
+    _load_dataset(req.dataset_id)
+    if req.engine not in {"native", "nautilus", "lean", "vectorbt"}:
+        raise HTTPException(status_code=422, detail="unsupported experiment engine")
+    record = experiment_store.create(
+        ExperimentSpec(
+            dataset_id=req.dataset_id,
+            engine=req.engine,
+            strategy=req.strategy,
+            parameters=req.parameters,
+            initial_cash=req.initial_cash,
+            quantity=req.quantity,
+        )
+    )
+    return asdict(record)
+
+
+@app.get("/experiments/{experiment_id}")
+def get_experiment(experiment_id: str):
+    try:
+        record = experiment_store.require(experiment_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="experiment not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return asdict(record)
+
+
+@app.post("/experiments/{experiment_id}/run")
+def run_experiment(experiment_id: str):
+    try:
+        record = experiment_store.require(experiment_id)
+        dataset = _load_dataset(record.spec.dataset_id)
+        completed = worker_service.run(record, dataset)
+        return asdict(completed)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="experiment not found") from exc
+    except (WorkerUnavailable, WorkerFailed, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/lean/exports")
+def create_lean_export(req: LeanExportRequest):
+    dataset = _load_dataset(req.dataset_id)
+    try:
+        export = lean_exporter.export_sma(
+            dataset,
+            req.parameters,
+            req.initial_cash,
+        )
+        return asdict(export)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
 
 
 @app.get("/simulations/plans")

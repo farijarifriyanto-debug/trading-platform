@@ -38,6 +38,7 @@ class VectorBTResearch:
         slow: int = 50,
         initial_cash: float = 100_000.0,
         fees: float = 0.0005,
+        quantity: float | None = None,
     ) -> VectorBTResult:
         if fast <= 0 or slow <= fast:
             raise ValueError("require 0 < fast < slow")
@@ -48,12 +49,17 @@ class VectorBTResearch:
         slow_ma = self.vbt.MA.run(prices, slow)
         entries = fast_ma.ma_crossed_above(slow_ma)
         exits = fast_ma.ma_crossed_below(slow_ma)
+        portfolio_kwargs = {
+            "init_cash": initial_cash,
+            "fees": fees,
+        }
+        if quantity is not None:
+            portfolio_kwargs["size"] = quantity
         portfolio = self.vbt.Portfolio.from_signals(
             prices,
             entries,
             exits,
-            init_cash=initial_cash,
-            fees=fees,
+            **portfolio_kwargs,
         )
         values = portfolio.value()
         final_value = values.iloc[-1] if hasattr(values, "iloc") else values[-1]

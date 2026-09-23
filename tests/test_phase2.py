@@ -108,7 +108,7 @@ class _FakePortfolioResult:
 
 class _FakePortfolio:
     @staticmethod
-    def from_signals(prices, entries, exits, init_cash, fees):
+    def from_signals(prices, entries, exits, init_cash, fees, **kwargs):
         return _FakePortfolioResult()
 
 
