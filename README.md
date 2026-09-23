@@ -2,18 +2,17 @@
 
 Modular, paper-first algorithmic trading and research platform. **Live trading remains disabled.**
 
-## Phase 4 status
+## Phase 5 status
 
 - CCXT public realtime ticker + OHLCV
-- Content-addressed historical datasets with SHA-256 IDs and integrity checks
+- SHA-256 content-addressed historical datasets
 - Strategy registry and deterministic parameter sweeps
-- Paper execution with mandatory risk gates and persistent audit
-- Optional VectorBT research adapter
-- **NautilusTrader simulation boundary**
-- **QuantConnect LEAN simulation boundary**
-- Immutable, content-addressed simulation plans
-- **Built-in responsive operations dashboard**
-- Control-plane metrics
+- Paper execution with mandatory risk gates and audit
+- VectorBT research integration
+- NautilusTrader 2.x isolated simulation worker
+- QuantConnect LEAN deterministic export pipeline
+- Experiment registry and cross-engine comparison
+- Responsive read-only operations dashboard
 - FastAPI, Docker/Compose, GitHub Actions CI
 
 ## Architecture
@@ -24,27 +23,28 @@ Exchange public data
        CCXT
         |
 Historical Dataset Store
-   |                |
-Strategy         Research / Sweep
-   |                |
-   +---- Simulation Boundaries ----+
-   |          |                    |
- Paper     Nautilus              LEAN
- Broker    backtest plan         backtest plan
-   |
-Risk -> Portfolio -> Audit
+        |
+   Experiment Spec
+   /      |       \
+Native  VectorBT  Nautilus subprocess
+   \      |       /
+    Experiment Registry
           |
-      API / Dashboard
+     Comparison API
+          |
+   Dashboard / Metrics
+
+Dataset -> LEAN export bundle -> LEAN CLI/Docker (optional external runner)
 ```
 
-NautilusTrader and LEAN are currently **simulation boundaries**, not execution services. The platform generates reproducible backtest plans but does not start either external engine and does not expose live execution.
+The execution-capable platform path remains **paper only**. Research and simulation engines cannot submit live exchange orders.
 
-## Run
+## Run control plane
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev,crypto]"
+pip install -e ".[dev,crypto,research]"
 pytest -q
 uvicorn trading_platform.api:app --reload
 ```
@@ -53,23 +53,105 @@ Open:
 
 - Dashboard: `http://127.0.0.1:8000/`
 - API docs: `http://127.0.0.1:8000/docs`
-- Health: `http://127.0.0.1:8000/health`
+- Worker health: `http://127.0.0.1:8000/workers/health`
 
-## Dashboard
+## NautilusTrader isolated worker
 
-The built-in dashboard refreshes every 10 seconds and shows:
+NautilusTrader 2.x currently requires Python 3.12+. Keep it outside the control-plane environment:
 
-- historical dataset count and metadata
-- simulated paper cash and open positions
-- audit event count and recent events
-- available simulation engines
-- paper portfolio state
+```bash
+uv venv --python python3.12 ~/.venvs/trading-nautilus
+cd /tmp
+uv pip install --python ~/.venvs/trading-nautilus/bin/python --pre nautilus_trader pandas
 
-It uses the same read-only control-plane API endpoints and has no order-entry controls.
+export NAUTILUS_WORKER_PYTHON=$HOME/.venvs/trading-nautilus/bin/python
+```
+
+The API invokes `workers/nautilus_worker.py` as a subprocess with a JSON job and a separate JSON result file. The worker:
+
+- consumes an immutable dataset
+- creates a synthetic simulation instrument
+- replays external OHLCV bars through NautilusTrader's `BacktestEngine`
+- uses L1 bar execution
+- runs a long-only SMA strategy
+- returns fills, positions, equity, engine version, and return
+- always reports `live_mode=false`
+
+NautilusTrader is not installed into the API container and has no exchange credentials.
+
+## Experiments
+
+Create one experiment:
+
+```bash
+curl -X POST http://127.0.0.1:8000/experiments \
+  -H 'content-type: application/json' \
+  -d '{
+    "dataset_id":"<dataset_id>",
+    "engine":"nautilus",
+    "strategy":"sma_trend",
+    "parameters":{"fast":5,"slow":20},
+    "initial_cash":100000,
+    "quantity":0.001
+  }'
+```
+
+Run it:
+
+```bash
+curl -X POST http://127.0.0.1:8000/experiments/<experiment_id>/run
+```
+
+Supported executable experiment engines:
+
+- `native`
+- `vectorbt` when the `research` extra is installed
+- `nautilus` when the isolated Python 3.12 worker environment is installed
+
+Compare completed results:
+
+```bash
+curl 'http://127.0.0.1:8000/experiments/compare?dataset_id=<dataset_id>'
+```
+
+Experiment IDs are deterministic SHA-256 hashes of dataset, engine, strategy, parameters, initial cash, and quantity.
+
+Different engines have different execution semantics, so close-but-not-identical results are expected. The registry preserves those differences instead of forcing them to match.
+
+## LEAN export pipeline
+
+Install the official LEAN CLI separately:
+
+```bash
+uv venv --python python3.12 ~/.venvs/trading-lean
+uv pip install --python ~/.venvs/trading-lean/bin/python lean
+~/.venvs/trading-lean/bin/lean --version
+```
+
+Create a deterministic backtest-only bundle:
+
+```bash
+curl -X POST http://127.0.0.1:8000/lean/exports \
+  -H 'content-type: application/json' \
+  -d '{
+    "dataset_id":"<dataset_id>",
+    "parameters":{"fast":5,"slow":20},
+    "initial_cash":100000
+  }'
+```
+
+Each export contains:
+
+```text
+main.py
+config.json
+manifest.json
+<dataset_id>.csv
+```
+
+The generated configuration sets `live-mode=false`. LEAN CLI local backtests use the official Docker engine and require a configured LEAN workspace. The platform never invokes `lean live`.
 
 ## Historical datasets
-
-Capture or reuse public CCXT data:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/datasets/ccxt \
@@ -77,55 +159,7 @@ curl -X POST http://127.0.0.1:8000/datasets/ccxt \
   -d '{"exchange":"kraken","symbol":"BTC/USD","timeframe":"1h","limit":200,"refresh":false}'
 ```
 
-The response includes a SHA-256 `dataset_id`. Identical canonical content produces the same ID. Loading a dataset re-verifies the hash.
-
-## Strategy research
-
-Catalog:
-
-```bash
-curl http://127.0.0.1:8000/strategies
-```
-
-Parameter sweep against an immutable dataset:
-
-```bash
-curl -X POST http://127.0.0.1:8000/research/sweeps/sma \
-  -H 'content-type: application/json' \
-  -d '{"dataset_id":"<dataset_id>","quantity":0.001,"fast_values":[3,5,10],"slow_values":[20,50]}'
-```
-
-Research output is not a profitability guarantee.
-
-## NautilusTrader / LEAN simulation boundaries
-
-Available engines:
-
-```bash
-curl http://127.0.0.1:8000/simulations/engines
-```
-
-Create a NautilusTrader backtest plan:
-
-```bash
-curl -X POST http://127.0.0.1:8000/simulations/nautilus/plans \
-  -H 'content-type: application/json' \
-  -d '{"dataset_id":"<dataset_id>","strategy":"sma_trend","parameters":{"fast":5,"slow":20}}'
-```
-
-Create a LEAN backtest plan:
-
-```bash
-curl -X POST http://127.0.0.1:8000/simulations/lean/plans \
-  -H 'content-type: application/json' \
-  -d '{"dataset_id":"<dataset_id>","strategy":"sma_trend","parameters":{"fast":5,"slow":20}}'
-```
-
-Each plan receives a deterministic SHA-256 `plan_id` and is persisted for provenance.
-
-The Nautilus boundary mirrors the project's documented high-level backtest concepts: venue, data, engine configuration, explicit fee model, and shutdown-on-error. The LEAN boundary emits a backtest-only configuration with `live-mode=false`.
-
-These are deliberately adapter contracts. Heavy external engines are not bundled into the API container yet.
+Identical canonical content produces the same SHA-256 dataset ID. Dataset loads verify the hash before use.
 
 ## Paper trading
 
@@ -146,26 +180,37 @@ Docker Compose persists `/data`:
 /data/historical/datasets/*.json
 /data/historical/refs/*.json
 /data/simulations/*.json
+/data/experiments/*.json
+/data/lean-exports/*
 ```
 
 ## Safety gates
 
-- only paper execution exists
-- no live exchange-order code path
-- simulation plans always report `live_mode=false`
-- Nautilus/LEAN adapters cannot submit orders
-- short selling disabled by default in the paper broker
-- paper buying power enforced
+- live exchange-order code does not exist
+- paper execution is the only execution path
+- Nautilus runs in an isolated simulation subprocess
+- Nautilus jobs always return `live_mode=false`
+- VectorBT has no execution adapter
+- LEAN output is backtest-only and generated with `live-mode=false`
+- no `lean live` invocation exists
 - all paper orders pass `RiskManager`
-- datasets and simulation plans are hash-addressed
-- paper fills and strategy steps are audit logged
-- dashboard has no order-entry controls
+- short selling is disabled by default in paper execution
+- datasets, plans, exports, and experiments carry deterministic provenance
+- dashboard is read-only
+
+## Validation
+
+Phase 5 validation includes:
+
+- unit/API suite
+- actual NautilusTrader 2.x worker execution
+- public Kraken dataset -> Nautilus experiment end-to-end
+- native/VectorBT/Nautilus comparison on the same dataset
+- LEAN CLI installation/health
+- deterministic LEAN bundle generation
+
+Backtest and simulation results are research outputs, not profit guarantees.
 
 ## Next phase
 
-1. Run NautilusTrader as an isolated optional simulation worker.
-2. Add LEAN worker/export pipeline without coupling it to paper execution.
-3. Experiment registry: dataset + strategy + parameters + engine + result provenance.
-4. Compare sweep, VectorBT, Nautilus, and LEAN results.
-5. AI/FinRL research workflow with dataset/model provenance.
-6. Keep live trading behind a separate future security and risk review.
+Phase 6 focuses on AI/FinRL research: model/dataset provenance, walk-forward evaluation, robustness gates, candidate generation, and reproducible AI-assisted experiments. AI remains separated from order execution.
