@@ -3,4 +3,11 @@ services:
     build: .
     ports:
       - "8000:8000"
+    environment:
+      TRADING_AUDIT_PATH: /data/paper-audit.jsonl
+    volumes:
+      - trading-data:/data
     restart: unless-stopped
+
+volumes:
+  trading-data:

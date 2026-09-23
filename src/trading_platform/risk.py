@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 
-from .domain import OrderIntent
+from .domain import OrderIntent, Side
 
 
 @dataclass(frozen=True)
 class RiskPolicy:
     max_order_notional: float = 10_000.0
     max_position_notional: float = 25_000.0
+    allow_short: bool = False
 
 
 class RiskRejected(ValueError):
@@ -23,7 +24,10 @@ class RiskManager:
         notional = order.quantity * order.price
         if notional > self.policy.max_order_notional:
             raise RiskRejected("order notional exceeds limit")
-        signed = order.quantity if order.side.value == "buy" else -order.quantity
-        projected = abs(current_position + signed) * order.price
-        if projected > self.policy.max_position_notional:
+
+        signed = order.quantity if order.side == Side.BUY else -order.quantity
+        projected_quantity = current_position + signed
+        if projected_quantity < 0 and not self.policy.allow_short:
+            raise RiskRejected("short positions are disabled")
+        if abs(projected_quantity) * order.price > self.policy.max_position_notional:
             raise RiskRejected("projected position exceeds limit")
